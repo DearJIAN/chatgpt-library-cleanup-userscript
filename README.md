@@ -5,6 +5,14 @@
 > 当前版本：**0.8.3**  
 > 适用页面：`https://chatgpt.com/library`
 
+## 为什么做这个项目？
+
+ChatGPT Library 在长期使用后很容易积累大量上传文件和图片。当文件数量达到数千个时，如果想清理较早的历史文件，官方界面目前主要依赖逐项加载和手动操作，处理大量旧文件会非常耗时。
+
+这个项目最初就是为了解决这个问题：希望能够按照一个明确的截止日期，自动扫描 ChatGPT Library 中的本地文件，并安全、快速地清理较早的历史文件，而不影响较新的文件以及 Google Drive 等外部来源。
+
+在实际开发过程中，ChatGPT Library 的目录结构、cursor 分页、文件 ID、删除接口等都经历了多轮验证和修正，因此脚本最终采用了“目录树递归 × 每目录 cursor 分页”、soft delete、首次单文件验证、fail-closed 和补漏扫描等机制，尽可能降低批量清理时的误删风险。
+
 ## 功能
 
 - 通过 ChatGPT 网页当前使用的 `/backend-api/files/library/nodes` 接口读取 Library；
