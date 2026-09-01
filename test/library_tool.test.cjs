@@ -150,3 +150,76 @@ test('uses only retryable delete statuses and exponential backoff', () => {
   assert.equal(tool.deleteRetryDelayMs(429, 2), 3200);
   assert.equal(tool.deleteRetryDelayMs(503, 2), 1400);
 });
+
+test('exposes page records before the next cursor is scheduled', async () => {
+  const events = [];
+  const pages = new Map([
+    ['ROOT::FIRST', { items: [file('first', null)], cursor: 'next' }],
+    ['ROOT::next', { items: [file('second', null)], cursor: null }],
+  ]);
+  await tool.traverseLibraryTree(async (parent, cursor) => pages.get(`${parent || 'ROOT'}::${cursor || 'FIRST'}`), {
+    onPage: ({ records, nextCursor }) => events.push({ records: records.map((x) => x.fileId), nextCursor }),
+  });
+  assert.deepEqual(events, [
+    { records: ['file_first'], nextCursor: 'next' },
+    { records: ['file_second'], nextCursor: null },
+  ]);
+});
+
+test('delete queue accepts valid old files immediately and deduplicates them', () => {
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
+  const old = { libraryFileId: 'libfile_old', fileId: 'file-old', createdAt: '2026-07-31T00:00:00Z', externalProvider: '' };
+  const drive = { ...old, libraryFileId: 'libfile_drive', fileId: 'file-drive', externalProvider: 'google_drive' };
+  assert.equal(queue.enqueue([old, old, drive]), 1);
+  assert.deepEqual(queue.snapshot().queued.map((x) => x.fileId), ['file-old']);
+});
+
+test('streaming delete probes one target before starting the remaining workers', async () => {
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
+  queue.enqueue([
+    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_c', fileId: 'file_c', createdAt: '2020-01-01Z', externalProvider: '' },
+  ]);
+  queue.close();
+  const started = [];
+  const result = await tool.runDeleteQueuePipeline({
+    queue, concurrency: 2, deleteOne: async (record) => { started.push(record.fileId); },
+  });
+  assert.deepEqual(started.sort(), ['file_a', 'file_b', 'file_c']);
+  assert.equal(started[0], 'file_a');
+  assert.equal(result.probeSucceeded, true);
+  assert.equal(result.failed.length, 0);
+});
+
+test('failed delete probe prevents all later delete requests', async () => {
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
+  queue.enqueue([
+    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', externalProvider: '' },
+  ]);
+  queue.close();
+  const started = [];
+  const result = await tool.runDeleteQueuePipeline({
+    queue, concurrency: 10, deleteOne: async (record) => { started.push(record.fileId); throw new Error('probe failed'); },
+  });
+  assert.deepEqual(started, ['file_a']);
+  assert.equal(result.probeSucceeded, false);
+});
+
+test('stop prevents new claims while an in-flight delete is allowed to finish', async () => {
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
+  queue.enqueue([
+    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', externalProvider: '' },
+  ]);
+  queue.close();
+  let stopped = false;
+  const started = [];
+  const result = await tool.runDeleteQueuePipeline({
+    queue, concurrency: 1, shouldStop: () => stopped,
+    deleteOne: async (record) => { started.push(record.fileId); stopped = true; },
+  });
+  assert.deepEqual(started, ['file_a']);
+  assert.equal(result.remaining, 1);
+});

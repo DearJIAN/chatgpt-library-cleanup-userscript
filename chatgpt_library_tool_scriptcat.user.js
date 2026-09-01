@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.7.0
+// @version      0.8.0
 // @description  自动捕获 ChatGPT Library 真实接口，自动触发/学习分页并全量扫描；扫描完整后可按日期高速并发软删除旧文件。含诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -13,7 +13,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.7.0';
+  const SCRIPT_VERSION = '0.8.0';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -73,6 +73,100 @@
     if (!Number.isFinite(toTimestamp(record?.createdAt))) reasons.push('createdAt 无法解析');
     if (record?.externalProvider) reasons.push('externalProvider 非空');
     return { valid: reasons.length === 0, reasons };
+  }
+
+  function createDeleteQueue({ cutoffMs, onEnqueue } = {}) {
+    const queue = [];
+    const queued = new Set();
+    const deleted = new Set();
+    const waiters = [];
+    let closed = false;
+    let stopped = false;
+
+    function eligible(record) {
+      const validation = validateDeletionTarget(record);
+      return validation.valid && Number.isFinite(cutoffMs) && toTimestamp(record.createdAt) < cutoffMs &&
+        !queued.has(record.libraryFileId) && !deleted.has(record.libraryFileId);
+    }
+    function enqueue(records) {
+      let added = 0;
+      for (const record of Array.isArray(records) ? records : []) {
+        if (!eligible(record)) continue;
+        queued.add(record.libraryFileId);
+        queue.push(record);
+        added += 1;
+        onEnqueue?.(record);
+      }
+      while (waiters.length && queue.length && !stopped) waiters.shift()(queue.shift());
+      return added;
+    }
+    function next() {
+      if (stopped || queue.length) return Promise.resolve(stopped ? null : queue.shift() || null);
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => waiters.push(resolve));
+    }
+    function waitForItem() {
+      if (queue.length) return Promise.resolve(queue[0]);
+      if (closed || stopped) return Promise.resolve(null);
+      return new Promise((resolve) => {
+        const check = (record) => resolve(record);
+        waiters.push((record) => { if (record) { queue.unshift(record); check(record); } else check(null); });
+      });
+    }
+    function close() {
+      closed = true;
+      while (waiters.length) waiters.shift()(null);
+    }
+    function stop() {
+      stopped = true;
+      while (waiters.length) waiters.shift()(null);
+    }
+    function markDeleted(record) { if (record?.libraryFileId) deleted.add(record.libraryFileId); }
+    return {
+      enqueue, next, waitForItem, close, stop, markDeleted,
+      snapshot: () => ({ queued: [...queue], queuedCount: queued.size, deleted: [...deleted], stopped, closed }),
+      get length() { return queue.length; },
+    };
+  }
+
+  async function runDeleteQueuePipeline({ queue, concurrency = DEFAULT_CONCURRENCY, deleteOne, shouldStop, onProgress } = {}) {
+    if (!queue || typeof queue.next !== 'function' || typeof deleteOne !== 'function') throw new Error('删除队列参数无效。');
+    const failed = [];
+    let succeeded = 0;
+    let processed = 0;
+    if (shouldStop?.()) return { probeSucceeded: false, deleted: 0, failed, processed, remaining: queue.length, stopped: true };
+    const first = await queue.next();
+    if (!first) return { probeSucceeded: false, deleted: 0, failed, processed, remaining: queue.length };
+    try {
+      await deleteOne(first);
+      queue.markDeleted(first);
+      succeeded += 1;
+      processed += 1;
+      onProgress?.({ deleted: succeeded, failed: 0, processed, total: null, probing: true });
+    } catch (error) {
+      failed.push({ record: first, error: String(error?.message || error) });
+      queue.stop();
+      return { probeSucceeded: false, deleted: 0, failed, processed, remaining: queue.length };
+    }
+    async function worker() {
+      while (!shouldStop?.()) {
+        const record = await queue.next();
+        if (!record) return;
+        try {
+          await deleteOne(record);
+          queue.markDeleted(record);
+          succeeded += 1;
+        } catch (error) {
+          if (error?.message === 'STOP_REQUESTED') return;
+          failed.push({ record, error: String(error?.message || error) });
+        }
+        processed += 1;
+        onProgress?.({ deleted: succeeded, failed: failed.length, processed, total: null, probing: false });
+      }
+    }
+    const workers = Math.max(0, Math.min(MAX_CONCURRENCY, Number(concurrency) - 1));
+    await Promise.all(Array.from({ length: workers }, worker));
+    return { probeSucceeded: true, deleted: succeeded, failed, processed, remaining: queue.length, stopped: Boolean(shouldStop?.()) };
   }
 
   function cloneJson(value) {
@@ -568,7 +662,9 @@
           }
         }
       }
-      options.onPage?.({ parentDirectoryId: state.parentDirectoryId, cursor: state.cursor, nextCursor: parsed.cursor, directoryComplete: parsed.cursor === null, pages, files: files.size, pending: directoryQueue.length });
+      const pageRecords = [...files.values()].filter((record) => parsed.items.some((item) => item?.kind === 'file' && item.id === record.libraryFileId));
+      const nextState = { parentDirectoryId: state.parentDirectoryId, cursor: parsed.cursor };
+      options.onPage?.({ parentDirectoryId: state.parentDirectoryId, cursor: state.cursor, nextCursor: parsed.cursor, nextState, records: pageRecords, directoryComplete: parsed.cursor === null, pages, files: files.size, pending: directoryQueue.length });
       if (parsed.cursor !== null) directoryQueue.unshift({ parentDirectoryId: state.parentDirectoryId, cursor: parsed.cursor });
     }
     return { files: [...files.values()], pages, requests, directories: queuedDirectories.size, complete: true };
@@ -625,6 +721,8 @@
     isValidFileId,
     isValidLibraryFileId,
     validateDeletionTarget,
+    createDeleteQueue,
+    runDeleteQueuePipeline,
     traverseLibraryTree,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
@@ -996,7 +1094,7 @@
     throw lastError || new Error('Library nodes 请求失败');
   }
 
-  async function directLibraryTreeScan(seed) {
+  async function directLibraryTreeScan(seed, options = {}) {
     state.scan.mode = '后台直读目录树 + cursor 分页';
     const result = await traverseLibraryTree(
       async (parentDirectoryId, cursor) => {
@@ -1006,7 +1104,7 @@
       },
       {
         shouldStop: () => state.stopRequested,
-        onPage: ({ parentDirectoryId, cursor, nextCursor, directoryComplete, pages, pending }) => {
+        onPage: ({ parentDirectoryId, cursor, nextCursor, records, directoryComplete, pages, pending }) => {
           state.scan.pageCount = pages;
           state.scan.requestCount = pages;
           state.scan.currentDirectoryId = parentDirectoryId;
@@ -1014,6 +1112,10 @@
           state.scan.pendingDirectories = pending;
           state.scan.directoryPageCount = pages;
           if (directoryComplete) state.scan.processedDirectories += 1;
+          for (const record of records || []) {
+            state.scan.records.set(record.libraryFileId, record);
+          }
+          options.onPage?.({ parentDirectoryId, cursor, nextCursor, records: records || [], directoryComplete });
           updateUi();
         },
       },
@@ -1281,6 +1383,89 @@
 
   async function startDelete() {
     if (state.scanning || state.deleting) return;
+    if (!isLibraryPage()) { root.alert('请先打开 ChatGPT 的 Library 页面。'); return; }
+    const seed = latestListEvent();
+    if (!seed || !isLibraryNodesUrl(seed.request.url)) {
+      root.alert('尚未捕获到可安全直读的 Library nodes 首屏请求，请刷新 Library 页面后重试。');
+      return;
+    }
+    const dateText = String(root.document.getElementById('cgpt-lib-tool-cutoff')?.value || DEFAULT_CUTOFF).trim();
+    const concurrency = Number(root.document.getElementById('cgpt-lib-tool-concurrency')?.value || DEFAULT_CONCURRENCY);
+    let cutoffMs;
+    try { cutoffMs = localCutoffMs(dateText); } catch (error) { root.alert(error.message); return; }
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
+      root.alert(`并发数必须是 1～${MAX_CONCURRENCY} 的整数。`); return;
+    }
+
+    state.stopRequested = false;
+    state.scanning = true;
+    state.deleting = false;
+    state.scan.records = new Map();
+    state.scan.complete = false;
+    state.scan.warning = '';
+    state.scan.mode = '扫描中：目录树生产者 + 删除队列';
+    state.scan.signature = seed.signature;
+    state.scan.seedEventId = seed.id;
+    state.scan.pageCount = 0;
+    state.scan.requestCount = 0;
+    state.scan.processedDirectories = 0;
+    state.scan.pendingDirectories = 0;
+    state.scan.currentDirectoryId = null;
+    state.scan.currentCursor = null;
+    const queue = createDeleteQueue({ cutoffMs });
+    state.deleteQueue = queue;
+    updateUi();
+
+    const scanPromise = directLibraryTreeScan(seed, { onPage: ({ records }) => queue.enqueue(records) })
+      .then((complete) => {
+        if (complete) {
+          state.scan.complete = true;
+          state.scan.mode = '后台直读目录树完成（删除队列已关闭）';
+        }
+        return complete;
+      })
+      .finally(() => queue.close());
+    try {
+      const first = await queue.waitForItem();
+      const scanResult = first ? null : await scanPromise;
+      if (!first) {
+        if (scanResult?.complete) root.alert(`扫描完整，但没有发现创建时间早于 ${dateText} 的可删除本地文件。`);
+        return;
+      }
+      const confirmed = root.confirm(
+        `ChatGPT Library 流式清理\n\n` +
+        `扫描仍在继续，目前已发现将删除：${queue.length} 个文件\n` +
+        `日期规则：创建时间 < ${dateText} 本地 00:00\n` +
+        `并发：${concurrency}\n\n` +
+        `将先对 1 个文件执行 soft delete 探测；探测失败会阻止其余请求。\n` +
+        `确定开始吗？`,
+      );
+      if (!confirmed) { queue.stop(); return; }
+      state.deleting = true;
+      state.deleteStartedAt = Date.now();
+      updateUi();
+      const deletePromise = runDeleteQueuePipeline({
+        queue, concurrency, shouldStop: () => state.stopRequested,
+        deleteOne,
+        onProgress: ({ deleted, failed }) => { state.deleteSucceeded = deleted; state.deleteFailed = failed; updateUi(); },
+      });
+      const result = await Promise.all([scanPromise, deletePromise]).then((values) => values[1]);
+      if (result.failed.length) console.error('[ChatGPT Library 工具] 删除失败：', result.failed);
+      root.alert(`流式清理结束。\n\n成功：${result.deleted}\n失败：${result.failed.length}\n未处理：${result.remaining}`);
+      if (result.probeSucceeded && result.remaining === 0 && !state.scan.warning) state.scan.warning = '删除完成；请刷新页面后重新扫描确认列表状态。';
+    } catch (error) {
+      if (error?.message === 'STOP_REQUESTED') root.alert('扫描/删除已停止。');
+      else { state.scan.warning = `流式扫描失败：${error?.message || error}`; root.alert(state.scan.warning); }
+    } finally {
+      queue.close();
+      state.scanning = false;
+      state.deleting = false;
+      updateUi();
+    }
+  }
+
+  async function startDeleteAfterComplete() {
+    if (state.scanning || state.deleting) return;
     if (!state.scan.complete) {
       root.alert('为了避免漏删/误判，必须先完成“自动扫描全部”。当前扫描尚未确认完整。');
       return;
@@ -1458,6 +1643,7 @@
     const status = root.document.getElementById('cgpt-lib-tool-status');
     const scanBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="scan"]');
     const deleteBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="delete"]');
+    const pipelineBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="pipeline"]');
     const stopBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="stop"]');
 
     if (mainButton) {
@@ -1474,9 +1660,11 @@
     if (requests) requests.textContent = String(state.scan.requestCount);
     if (cursor) cursor.textContent = state.scan.currentCursor ? String(state.scan.currentCursor).slice(0, 36) : 'null';
     if (targetPreview) {
-      let preview = '将删除：待完整扫描';
+      let preview = '将删除：待扫描发现';
       const cutoff = root.document.getElementById('cgpt-lib-tool-cutoff')?.value;
-      if (state.scan.complete && cutoff) {
+      if (state.deleteQueue) {
+        preview = `将删除：${state.deleteQueue.snapshot().queuedCount} 个文件（队列中/已发现）`;
+      } else if (state.scan.complete && cutoff) {
         try { preview = `将删除：${selectDeletionTargets([...state.scan.records.values()], localCutoffMs(cutoff)).targets.length} 个文件`; }
         catch (_) { preview = '将删除：截止日期无效'; }
       }
@@ -1484,6 +1672,7 @@
     }
     if (status) {
       if (state.stopRequested && (state.scanning || state.deleting)) status.innerHTML = '<b>正在停止…</b>';
+      else if (state.scanning && state.deleting) status.innerHTML = `<b>扫描 + 删除中</b>：已发现 ${state.scan.records.size} 个，成功 ${state.deleteSucceeded || 0}，失败 ${state.deleteFailed || 0}`;
       else if (state.scanning) status.innerHTML = `<b>扫描中</b>：${state.scan.records.size} 个，网络请求中 ${state.inflight}`;
       else if (state.deleting) status.innerHTML = '<b>删除中</b>：可随时点“停止”';
       else if (state.scan.complete) status.innerHTML = `<b>扫描完整</b>：可以执行删除${state.scan.warning ? `；${state.scan.warning}` : ''}`;
@@ -1492,6 +1681,7 @@
     }
     if (scanBtn) scanBtn.disabled = state.scanning || state.deleting;
     if (deleteBtn) deleteBtn.disabled = state.scanning || state.deleting || !state.scan.complete;
+    if (pipelineBtn) pipelineBtn.disabled = state.scanning || state.deleting;
     if (stopBtn) stopBtn.disabled = !state.scanning && !state.deleting;
   }
 
@@ -1527,7 +1717,7 @@
     panel.innerHTML = `
       <div style="font-size:16px;font-weight:800;margin-bottom:8px">ChatGPT Library 自动诊断 + 高速清理</div>
       <div style="padding:9px 10px;background:#0f3d35;border-radius:9px;margin-bottom:10px">
-        先完整扫描，后删除。正常路径按“目录树 × 每目录 cursor”后台直读，不要求把所有文件渲染到页面。
+        支持“仅完整扫描”或“扫描 + 流式 soft delete”。正常路径按“目录树 × 每目录 cursor”后台直读，不要求把所有文件渲染到页面。
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px">
         <div>捕获请求：<b id="cgpt-lib-tool-captured">0</b></div>
@@ -1548,6 +1738,7 @@
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:8px">
         <button data-act="scan">自动扫描全部</button>
+        <button data-act="pipeline">扫描并删除旧文件</button>
         <button data-act="delete" disabled>删除旧文件</button>
         <button data-act="stop" disabled>停止</button>
         <button data-act="copy">复制诊断 JSON</button>
@@ -1574,6 +1765,7 @@
       if (!target) return;
       const action = target.dataset.act;
       if (action === 'scan') autoScanAll();
+      else if (action === 'pipeline') startDelete();
       else if (action === 'delete') startDelete();
       else if (action === 'stop') stopCurrent();
       else if (action === 'copy') {
