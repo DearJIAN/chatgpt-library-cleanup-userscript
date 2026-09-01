@@ -2,18 +2,22 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.3
-// @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、诊断 JSON 导出与随时停止。
+// @version      0.8.4
+// @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、时间字段诊断、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @grant        none
 // @license      MIT
+// @updateURL    https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js
+// @downloadURL  https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js
+// @homepageURL  https://github.com/DearJIAN/chatgpt-library-cleanup-userscript
+// @supportURL   https://github.com/DearJIAN/chatgpt-library-cleanup-userscript/issues
 // ==/UserScript==
 
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.3';
+  const SCRIPT_VERSION = '0.8.4';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -238,6 +242,48 @@
     return undefined;
   }
 
+  function findScalarWithSourceByKeys(obj, keys, maxDepth = 3) {
+    function findKey(node, wantedKey, path, depth, seen) {
+      if (node == null || typeof node !== 'object' || depth > maxDepth || seen.has(node)) return null;
+      seen.add(node);
+      if (!Array.isArray(node) && Object.prototype.hasOwnProperty.call(node, wantedKey)) {
+        const value = node[wantedKey];
+        if (typeof value === 'string' || typeof value === 'number') return { value, key: wantedKey, path: path ? `${path}.${wantedKey}` : wantedKey };
+      }
+      for (const [key, value] of Object.entries(node)) {
+        if (value && typeof value === 'object') {
+          const found = findKey(value, wantedKey, path ? `${path}.${key}` : key, depth + 1, seen);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+    for (const key of keys || []) {
+      const found = findKey(obj, key, '', 0, new Set());
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function collectRawTimeFields(node, keys = RAW_TIME_KEYS, maxDepth = 3) {
+    const wanted = new Set(keys || []);
+    const output = [];
+    const seen = new Set();
+    function walk(value, path, depth) {
+      if (value == null || typeof value !== 'object' || depth > maxDepth || seen.has(value)) return;
+      seen.add(value);
+      for (const [key, child] of Object.entries(value)) {
+        const childPath = path ? `${path}.${key}` : key;
+        if (wanted.has(key) && (typeof child === 'string' || typeof child === 'number')) output.push({ key, path: childPath, value: child });
+        if (child && typeof child === 'object') walk(child, childPath, depth + 1);
+      }
+    }
+    walk(node, '', 0);
+    const order = new Map((keys || []).map((key, index) => [key, index]));
+    output.sort((a, b) => (order.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.key) ?? Number.MAX_SAFE_INTEGER) || a.path.localeCompare(b.path));
+    return output;
+  }
+
   function detectExternalProvider(node, maxDepth = 4, depth = 0, seen = new Set()) {
     if (!node || typeof node !== 'object' || depth > maxDepth || seen.has(node)) return '';
     seen.add(node);
@@ -278,13 +324,11 @@
         let fileId = findScalarByKeys(node, FILE_ID_KEYS, 2);
         if (!fileId && isValidFileId(node.id)) fileId = node.id;
         const name = findScalarByKeys(node, NAME_KEYS, 2);
-        const createdAt = findScalarByKeys(node, CREATED_KEYS, 2);
+        const createdResult = findScalarWithSourceByKeys(node, CREATED_KEYS, 2);
+        const createdAt = createdResult?.value ?? null;
         const sizeBytes = findScalarByKeys(node, SIZE_KEYS, 2);
-        const rawTimes = {};
-        for (const key of RAW_TIME_KEYS) {
-          if (Object.prototype.hasOwnProperty.call(node, key)) rawTimes[key] = node[key];
-        }
-        const createdAtSource = CREATED_KEYS.find((key) => Object.prototype.hasOwnProperty.call(rawTimes, key) && Number.isFinite(toTimestamp(rawTimes[key]))) || null;
+        const rawTimeEntries = collectRawTimeFields(node, RAW_TIME_KEYS, 2);
+        const rawTimes = Object.fromEntries(rawTimeEntries.map((entry) => [entry.key, entry.value]));
 
         if (
           node.kind === 'file' && isValidLibraryFileId(libraryFileId) && isValidFileId(fileId)
@@ -294,9 +338,11 @@
             fileId,
             parentDirectoryId: typeof node.parent_directory_id === 'string' ? node.parent_directory_id : null,
             name: typeof name === 'string' ? name : fileId,
-            createdAt: (typeof createdAt === 'string' || typeof createdAt === 'number') ? createdAt : null,
-            createdAtSource,
+            createdAt,
+            createdAtSource: createdResult?.key ?? null,
+            createdAtPath: createdResult?.path ?? null,
             rawTimes,
+            rawTimeEntries,
             sizeBytes: Number.isFinite(Number(sizeBytes)) ? Number(sizeBytes) : 0,
             externalProvider: detectExternalProvider(node),
           });
@@ -631,13 +677,14 @@
     if (time) precision = 'medium';
     else if (monthDay) precision = 'low';
     else if (fullDate) precision = 'high';
-    for (const [key, value] of Object.entries(rawTimes || {})) {
-      const parts = localDateParts(value);
+    const entries = Array.isArray(rawTimes) ? rawTimes : Object.entries(rawTimes || {}).map(([key, value]) => ({ key, path: key, value }));
+    for (const entry of entries) {
+      const parts = localDateParts(entry.value);
       if (!parts) continue;
       const matched = time ? parts.hour === Number(time[1]) && parts.minute === Number(time[2])
         : monthDay ? parts.year === now.getFullYear() && parts.month === Number(monthDay[1]) && parts.day === Number(monthDay[2])
           : fullDate ? parts.year === Number(fullDate[1]) && parts.month === Number(fullDate[2]) && parts.day === Number(fullDate[3]) : false;
-      if (matched) matches.push(key);
+      if (matched) matches.push({ key: entry.key, path: entry.path });
     }
     return { uiLikelyMatches: matches, confidence: matches.length === 1 ? precision : 'low', ambiguous: matches.length > 1 };
   }
@@ -654,7 +701,9 @@
     return (items || []).map((item) => ({
       fileName: item.fileName || null, libraryFileId: item.libraryFileId || null, parentDirectoryId: item.parentDirectoryId || null,
       createdAt: item.createdAt || null, createdAtSource: item.createdAtSource || null,
+      createdAtPath: item.createdAtPath || null,
       rawTimes: Object.fromEntries(Object.entries(item.rawTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
+      rawTimeEntries: (item.rawTimeEntries || []).filter((entry) => RAW_TIME_KEYS.includes(entry.key)).map((entry) => ({ key: entry.key, path: entry.path, value: entry.value })),
       parsedLocalTimes: Object.fromEntries(Object.entries(item.parsedLocalTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
       uiModifiedTimeText: item.uiModifiedTimeText ?? null, uiLikelyMatches: item.uiLikelyMatches || [], confidence: item.confidence || 'low',
     }));
@@ -668,7 +717,7 @@
       if (item.uiModifiedTimeText) summary.uiComparableCount += 1;
       if (item.ambiguous) summary.ambiguous += 1;
       else if (item.uiLikelyMatches?.length === 1) {
-        const key = item.uiLikelyMatches[0];
+        const key = item.uiLikelyMatches[0].key || item.uiLikelyMatches[0];
         summary.likelyMatches[key] = (summary.likelyMatches[key] || 0) + 1;
       }
     }
@@ -837,6 +886,8 @@
     isValidFileId,
     isValidLibraryFileId,
     validateDeletionTarget,
+    findScalarWithSourceByKeys,
+    collectRawTimeFields,
     matchUiTimeFields,
     extractUiModifiedTimeFromRows,
     sanitizeTimeDiagnostics,
@@ -1787,13 +1838,13 @@
     });
     state.timeFieldDiagnostics = candidates.map((record) => {
       const ui = extractUiModifiedTimeFromRows(rows, record);
-      const match = ui.uiModifiedTimeText ? matchUiTimeFields(ui.uiModifiedTimeText, record.rawTimes) : { uiLikelyMatches: [], confidence: 'low', ambiguous: false };
-      return { fileName: record.name, libraryFileId: record.libraryFileId, parentDirectoryId: record.parentDirectoryId, createdAt: record.createdAt, createdAtSource: record.createdAtSource, rawTimes: record.rawTimes, parsedLocalTimes: Object.fromEntries(Object.entries(record.rawTimes || {}).map(([key, value]) => [key, localTimeText(value)])), uiModifiedTimeText: ui.uiModifiedTimeText, reason: ui.reason, ...match };
+      const match = ui.uiModifiedTimeText ? matchUiTimeFields(ui.uiModifiedTimeText, record.rawTimeEntries || record.rawTimes) : { uiLikelyMatches: [], confidence: 'low', ambiguous: false };
+      return { fileName: record.name, libraryFileId: record.libraryFileId, parentDirectoryId: record.parentDirectoryId, createdAt: record.createdAt, createdAtSource: record.createdAtSource, createdAtPath: record.createdAtPath, rawTimes: record.rawTimes, rawTimeEntries: record.rawTimeEntries, parsedLocalTimes: Object.fromEntries((record.rawTimeEntries || []).map((entry) => [entry.path, localTimeText(entry.value)])), uiModifiedTimeText: ui.uiModifiedTimeText, reason: ui.reason, ...match };
     });
     const pre = root.document.getElementById('cgpt-lib-tool-time-diagnostic');
     if (pre) {
       const summary = summarizeTimeDiagnostics(state.timeFieldDiagnostics);
-      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n当前删除日期来源：${JSON.stringify(summary.createdAtSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}\n\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.createdAtSource || '未知'} = ${item.createdAt || '未知'}\n匹配：${item.uiLikelyMatches.join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${Object.entries(item.rawTimes).map(([key, value]) => `${key}: ${value} → 本地 ${item.parsedLocalTimes[key]}`).join('; ')}`).join('\n\n');
+      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n当前删除日期来源：${JSON.stringify(summary.createdAtSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}\n\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.createdAtSource || '未知'}\n路径：${item.createdAtPath || '未知'}\n值：${item.createdAt || '未知'}\n匹配：${item.uiLikelyMatches.map((match) => `${match.key} (${match.path})`).join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${(item.rawTimeEntries || []).map((entry) => `${entry.key} @ ${entry.path}: ${entry.value} → 本地 ${item.parsedLocalTimes[entry.path]}`).join('; ')}`).join('\n\n');
       pre.style.display = 'block';
     }
     updateUi();

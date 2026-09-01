@@ -11,6 +11,10 @@
 - 新增只读“诊断时间字段”功能；保留 nodes 响应中实际出现的原始时间字段和 `createdAtSource`；
 - 采集当前已渲染文件行的“修改时间”，并对后台字段执行本地时区下的弱匹配与 ambiguous 标记；
 - 诊断 JSON 增加 `timeFieldDiagnostics` 及摘要，继续脱敏；不改变删除规则、截止日期、扫描、删除或 verification 行为。
+- 修复 userscript `@version` / `SCRIPT_VERSION` 与 README 的版本不一致；统一为 0.8.4；
+- 时间字段使用统一递归 lookup，`createdAt`、`createdAtSource`、`createdAtPath` 来自同一次选择；`rawTimeEntries` 保留嵌套字段 path；
+- `updated` / `modified` 类字段仅用于诊断和 UI 对照，仍不参与删除日期 fallback；
+- 增加 `@updateURL`、`@downloadURL`、`@homepageURL`、`@supportURL`，均指向 public GitHub 仓库与完整 `.user.js` 文件。
 
 ## [0.8.3] - 2026-09-01
 

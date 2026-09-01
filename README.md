@@ -45,6 +45,20 @@ chatgpt_library_tool_scriptcat.user.js
 
 对于私有仓库，可以在 GitHub 打开该文件后复制源码，新建一个 ScriptCat / Tampermonkey 脚本并粘贴保存。
 
+## 自动更新
+
+本脚本支持 ScriptCat / Tampermonkey 从 GitHub Raw 检查更新。
+
+更新地址：
+
+`https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js`
+
+旧版本尚未包含自动更新 metadata，首次需要手动安装或覆盖安装一次 0.8.4（或更高版本）。此后，脚本管理器会按自己的检查周期读取 `@updateURL`，并通过 `@downloadURL` 获取完整 `.user.js` 文件。
+
+只有 GitHub 上的 `@version` 提高时，ScriptCat / Tampermonkey 才会判断有新版本；GitHub 新 commit 本身不会自动触发脚本更新。
+
+版本策略：纯 README、图片、CHANGELOG 或 LICENSE 变化不需要提升 userscript 版本；脚本行为或功能变化必须提升 `@version`。小 bug 可递增 patch（如 `0.8.4` → `0.8.5`），明显新功能可进入下一个 minor 版本，不兼容变化进入 major 版本。
+
 ## 使用方法
 
 ### 界面说明

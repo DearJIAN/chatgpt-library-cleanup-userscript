@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const tool = require('../chatgpt_library_tool_scriptcat.user.js');
 
 const file = (id, parent, created = '2026-07-31T00:00:00.000Z') => ({
@@ -330,12 +331,12 @@ test('matches UI today time and month-day text without forcing a semantic conclu
   const todayTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
   const todayIso = new Date(now.getTime() - (now.getSeconds() * 1000 + now.getMilliseconds())).toISOString();
   const timeMatch = tool.matchUiTimeFields(todayTime, { record_creation_time: todayIso });
-  assert.deepEqual(timeMatch.uiLikelyMatches, ['record_creation_time']);
+  assert.deepEqual(timeMatch.uiLikelyMatches.map((x) => x.key), ['record_creation_time']);
   assert.equal(timeMatch.confidence, 'medium');
 
   const monthDay = `${now.getMonth() + 1}月${now.getDate()}日`;
   const dateMatch = tool.matchUiTimeFields(monthDay, { updated_at: todayIso, modified_at: todayIso });
-  assert.deepEqual(dateMatch.uiLikelyMatches.sort(), ['modified_at', 'updated_at']);
+  assert.deepEqual(dateMatch.uiLikelyMatches.map((x) => x.key).sort(), ['modified_at', 'updated_at']);
   assert.equal(dateMatch.ambiguous, true);
 });
 
@@ -348,4 +349,52 @@ test('time diagnostic export contains no sensitive fields', () => {
   assert.equal(JSON.stringify(safe).includes('secret'), false);
   assert.equal(JSON.stringify(safe).includes('x@y.test'), false);
   assert.equal(safe[0].rawTimes.updated_at, 'x');
+});
+
+test('nested time lookup and raw collection share the same source and preserve paths', () => {
+  const [record] = tool.extractFileRecords({ items: [{
+    kind: 'file', id: 'libfile_nested', file_id: 'file_nested', name: 'nested.txt',
+    metadata: { record_creation_time: '2026-07-01T12:00:00Z', updated_at: '2026-08-18T03:00:00Z' },
+    attributes: { file_upload_time: '2026-07-01T12:01:00Z' },
+  }] });
+  assert.equal(record.createdAt, '2026-07-01T12:00:00Z');
+  assert.equal(record.createdAtSource, 'record_creation_time');
+  assert.equal(record.createdAtPath, 'metadata.record_creation_time');
+  assert.deepEqual(record.rawTimeEntries, [
+    { key: 'record_creation_time', path: 'metadata.record_creation_time', value: '2026-07-01T12:00:00Z' },
+    { key: 'file_upload_time', path: 'attributes.file_upload_time', value: '2026-07-01T12:01:00Z' },
+    { key: 'updated_at', path: 'metadata.updated_at', value: '2026-08-18T03:00:00Z' },
+  ]);
+});
+
+test('updated-only fields are diagnostic only and never become createdAt', () => {
+  const [record] = tool.extractFileRecords({ items: [{ kind: 'file', id: 'libfile_updated', file_id: 'file_updated', updated_at: '2026-08-18T03:00:00Z' }] });
+  assert.equal(record.createdAt, null);
+  assert.equal(record.createdAtSource, null);
+  assert.equal(record.rawTimeEntries[0].key, 'updated_at');
+});
+
+test('UI matches include full paths and ambiguous entries', () => {
+  const result = tool.matchUiTimeFields('8月18日', [
+    { key: 'updated_at', path: 'metadata.updated_at', value: '2026-08-18T03:00:00Z' },
+    { key: 'modified_at', path: 'attributes.modified_at', value: '2026-08-18T04:00:00Z' },
+  ]);
+  assert.equal(result.ambiguous, true);
+  assert.deepEqual(result.uiLikelyMatches, [
+    { key: 'updated_at', path: 'metadata.updated_at' },
+    { key: 'modified_at', path: 'attributes.modified_at' },
+  ]);
+});
+
+test('userscript metadata is 0.8.4 and points update/download to the public raw file', () => {
+  const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
+  const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
+  const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
+  const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
+  assert.equal(version, '0.8.4');
+  assert.equal(scriptVersion, version);
+  assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
+  assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
+  assert.match(source, /^\/\/ @homepageURL\s+https:\/\/github\.com\/DearJIAN\/chatgpt-library-cleanup-userscript$/m);
+  assert.match(source, /^\/\/ @supportURL\s+https:\/\/github\.com\/DearJIAN\/chatgpt-library-cleanup-userscript\/issues$/m);
 });
