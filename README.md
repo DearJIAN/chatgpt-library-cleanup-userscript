@@ -46,6 +46,36 @@ chatgpt_library_tool_scriptcat.user.js
 
 ## 使用方法
 
+### 界面说明
+
+下面是脚本在 ChatGPT Library 中真实运行时的界面示例。截图中的文件数量、日期和删除进度仅用于说明界面，实际数值会随你的 Library 内容变化。
+
+![ChatGPT Library Cleanup Userscript 运行界面](docs/images/library-tool-panel.webp)
+
+面板中的主要信息包括：
+
+- **捕获请求**：当前页面已捕获到的 Library 相关网络请求数量；
+- **扫描文件**：本次任务已经识别出的 Library 本地文件数量；
+- **最早日期**：当前已扫描记录中最早的创建时间；
+- **扫描模式**：显示当前使用的目录树 / cursor 扫描状态；
+- **已处理目录 / 待处理目录**：用于观察本地目录树遍历进度；
+- **总请求 / 当前 cursor**：用于观察后台分页是否持续推进；
+- **将删除**：当前已经发现、且符合截止日期与安全检查的目标数量；
+- **删除接口**：首次真实 soft-delete 是否已经在当前页面 session 中完成验证；
+- **状态栏**：例如“扫描 + 删除中”，并实时显示已扫描、成功删除和失败数量；
+- **删除截至日期（含当天）**：决定哪些旧文件进入删除目标；
+- **并发**：同时执行的删除 worker 数量，范围 1～20，默认 10。
+
+核心按钮：
+
+- **自动扫描全部**：只扫描，不执行删除；
+- **扫描并删除旧文件**：边扫描边删除，适合直接清理大量历史文件；
+- **删除已扫描旧文件**：如果扫描中途停止，只处理当前已经扫描到的记录；
+- **停止**：停止继续扫描和领取新的删除任务；
+- **复制诊断 JSON / 下载诊断 JSON**：导出已经脱敏的诊断信息；
+- **清空诊断日志**：清除面板内累计的诊断事件；
+- **关闭**：隐藏工具面板。
+
 ### 1. 打开 Library
 
 进入：
@@ -168,6 +198,9 @@ POST /backend-api/files/library/files/{library_file_id}/delete_stream
 ├─ chatgpt_library_tool_scriptcat.user.js   # Userscript 主脚本
 ├─ test/
 │  └─ library_tool.test.cjs                 # Node.js 测试
+├─ docs/
+│  └─ images/
+│     └─ library-tool-panel.webp            # README 界面示例
 ├─ README.md                                # 使用说明
 ├─ CHANGELOG.md                             # 版本变更记录
 └─ LICENSE                                  # MIT License
