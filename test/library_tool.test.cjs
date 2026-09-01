@@ -133,6 +133,15 @@ test('builds soft-delete URL with parent directory and stable IDs', () => {
   assert.match(url, /soft_delete=true/);
 });
 
+test('uses one file ID rule for scan and delete validation', () => {
+  assert.equal(tool.isValidFileId('file_abc'), true);
+  assert.equal(tool.isValidFileId('file-abc'), true);
+  assert.equal(tool.isValidFileId('arbitrary-id'), false);
+  assert.equal(tool.validateDeletionTarget({ libraryFileId: 'libfile_a', fileId: 'file_abc', createdAt: '2026-07-31T00:00:00Z', externalProvider: '' }).valid, true);
+  assert.equal(tool.validateDeletionTarget({ libraryFileId: 'libfile_a', fileId: 'file-abc', createdAt: '2026-07-31T00:00:00Z', externalProvider: '' }).valid, true);
+  assert.equal(tool.validateDeletionTarget({ libraryFileId: 'libfile_a', fileId: 'arbitrary-id', createdAt: '2026-07-31T00:00:00Z', externalProvider: '' }).valid, false);
+});
+
 test('uses only retryable delete statuses and exponential backoff', () => {
   assert.equal(tool.isRetryableDeleteStatus(429), true);
   assert.equal(tool.isRetryableDeleteStatus(503), true);

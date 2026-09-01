@@ -58,6 +58,23 @@
     return value && typeof value === 'object' && !Array.isArray(value);
   }
 
+  function isValidFileId(value) {
+    return typeof value === 'string' && /^file(?:_|-)/.test(value);
+  }
+
+  function isValidLibraryFileId(value) {
+    return typeof value === 'string' && /^libfile_/.test(value);
+  }
+
+  function validateDeletionTarget(record) {
+    const reasons = [];
+    if (!isValidLibraryFileId(record?.libraryFileId)) reasons.push('libraryFileId 无效');
+    if (!isValidFileId(record?.fileId)) reasons.push('fileId 无效');
+    if (!Number.isFinite(toTimestamp(record?.createdAt))) reasons.push('createdAt 无法解析');
+    if (record?.externalProvider) reasons.push('externalProvider 非空');
+    return { valid: reasons.length === 0, reasons };
+  }
+
   function cloneJson(value) {
     if (value == null) return value;
     return JSON.parse(JSON.stringify(value));
@@ -128,16 +145,15 @@
 
       if (isObject(node)) {
         let libraryFileId = findScalarByKeys(node, LIB_ID_KEYS, 2);
-        if (!libraryFileId && node.kind === 'file' && typeof node.id === 'string' && node.id.startsWith('libfile_')) libraryFileId = node.id;
+        if (!libraryFileId && node.kind === 'file' && isValidLibraryFileId(node.id)) libraryFileId = node.id;
         let fileId = findScalarByKeys(node, FILE_ID_KEYS, 2);
-        if (!fileId && typeof node.id === 'string' && /^file(?:_|-)/.test(node.id)) fileId = node.id;
+        if (!fileId && isValidFileId(node.id)) fileId = node.id;
         const name = findScalarByKeys(node, NAME_KEYS, 2);
         const createdAt = findScalarByKeys(node, CREATED_KEYS, 2);
         const sizeBytes = findScalarByKeys(node, SIZE_KEYS, 2);
 
         if (
-          node.kind === 'file' && typeof libraryFileId === 'string' && libraryFileId.startsWith('libfile_') &&
-          typeof fileId === 'string' && /^file(?:_|-)/.test(fileId)
+          node.kind === 'file' && isValidLibraryFileId(libraryFileId) && isValidFileId(fileId)
         ) {
           output.set(libraryFileId, {
             libraryFileId,
@@ -606,6 +622,9 @@
     parseLibraryNodesPayload,
     isRetryableDeleteStatus,
     deleteRetryDelayMs,
+    isValidFileId,
+    isValidLibraryFileId,
+    validateDeletionTarget,
     traverseLibraryTree,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
@@ -1286,12 +1305,18 @@
       root.alert(`完整扫描后，没有发现创建时间早于 ${dateText} 的可删除本地 Library 文件。`);
       return;
     }
-    const invalidTarget = targets.find((record) => (
-      typeof record.libraryFileId !== 'string' || !record.libraryFileId.startsWith('libfile_') ||
-      typeof record.fileId !== 'string' || !record.fileId.startsWith('file_') ||
-      !Number.isFinite(toTimestamp(record.createdAt)) || record.externalProvider
-    ));
+    const invalidTarget = targets.map((record, index) => ({ record, index, validation: validateDeletionTarget(record) }))
+      .find((entry) => !entry.validation.valid);
     if (invalidTarget) {
+      const { record, index, validation } = invalidTarget;
+      const safeId = (value, pattern) => typeof value === 'string' && pattern.test(value) ? value : '[invalid]';
+      console.warn('[ChatGPT Library 工具] 删除前一致性检查失败', {
+        targetIndex: index,
+        libraryFileId: safeId(record.libraryFileId, /^libfile_[A-Za-z0-9_-]+$/),
+        fileId: safeId(record.fileId, /^file(?:_|-)[A-Za-z0-9_-]+$/),
+        parentDirectoryId: safeId(record.parentDirectoryId, /^libdir_[A-Za-z0-9_-]+$/),
+        reasons: validation.reasons,
+      });
       root.alert('删除前一致性检查失败：存在身份、日期或来源无法确认的目标，已阻止整批删除。');
       return;
     }
@@ -1429,6 +1454,7 @@
     const pendingDirs = root.document.getElementById('cgpt-lib-tool-pending-dirs');
     const requests = root.document.getElementById('cgpt-lib-tool-requests');
     const cursor = root.document.getElementById('cgpt-lib-tool-cursor');
+    const targetPreview = root.document.getElementById('cgpt-lib-tool-target-preview');
     const status = root.document.getElementById('cgpt-lib-tool-status');
     const scanBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="scan"]');
     const deleteBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="delete"]');
@@ -1447,6 +1473,15 @@
     if (pendingDirs) pendingDirs.textContent = String(state.scan.pendingDirectories);
     if (requests) requests.textContent = String(state.scan.requestCount);
     if (cursor) cursor.textContent = state.scan.currentCursor ? String(state.scan.currentCursor).slice(0, 36) : 'null';
+    if (targetPreview) {
+      let preview = '将删除：待完整扫描';
+      const cutoff = root.document.getElementById('cgpt-lib-tool-cutoff')?.value;
+      if (state.scan.complete && cutoff) {
+        try { preview = `将删除：${selectDeletionTargets([...state.scan.records.values()], localCutoffMs(cutoff)).targets.length} 个文件`; }
+        catch (_) { preview = '将删除：截止日期无效'; }
+      }
+      targetPreview.textContent = preview;
+    }
     if (status) {
       if (state.stopRequested && (state.scanning || state.deleting)) status.innerHTML = '<b>正在停止…</b>';
       else if (state.scanning) status.innerHTML = `<b>扫描中</b>：${state.scan.records.size} 个，网络请求中 ${state.inflight}`;
@@ -1503,6 +1538,7 @@
         <div>待处理目录：<b id="cgpt-lib-tool-pending-dirs">0</b></div>
         <div>总请求：<b id="cgpt-lib-tool-requests">0</b></div>
         <div>当前 cursor：<b id="cgpt-lib-tool-cursor">null</b></div>
+        <div style="grid-column:1 / 3;color:#fbbf24" id="cgpt-lib-tool-target-preview">将删除：待完整扫描</div>
         <div style="grid-column:1 / 3;color:#fbbf24">删除接口：未进行真实单文件验证</div>
       </div>
       <div id="cgpt-lib-tool-status" style="padding:8px 9px;background:#1f2937;border-radius:8px;margin-bottom:10px">等待操作。</div>
