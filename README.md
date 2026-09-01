@@ -2,7 +2,7 @@
 
 一个用于 **ChatGPT Library（资料库）** 的 ScriptCat / Tampermonkey 用户脚本，可后台扫描 Library 目录树，并按指定截止日期批量执行 soft delete。
 
-> 当前版本：**0.8.4**
+> 当前版本：**0.8.5**
 > 适用页面：`https://chatgpt.com/library`
 
 ## 为什么做这个项目？
@@ -53,7 +53,7 @@ chatgpt_library_tool_scriptcat.user.js
 
 `https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js`
 
-旧版本尚未包含自动更新 metadata，首次需要手动安装或覆盖安装一次 0.8.4（或更高版本）。此后，脚本管理器会按自己的检查周期读取 `@updateURL`，并通过 `@downloadURL` 获取完整 `.user.js` 文件。
+旧版本尚未包含自动更新 metadata，首次需要手动安装或覆盖安装一次 0.8.4 或更高版本。此后，脚本管理器会按自己的检查周期读取 `@updateURL`，并通过 `@downloadURL` 获取完整 `.user.js` 文件。
 
 只有 GitHub 上的 `@version` 提高时，ScriptCat / Tampermonkey 才会判断有新版本；GitHub 新 commit 本身不会自动触发脚本更新。
 

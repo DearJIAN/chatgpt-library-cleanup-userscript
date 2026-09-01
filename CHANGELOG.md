@@ -4,6 +4,18 @@
 
 项目早期没有建立独立 CHANGELOG，以下内容根据现有 Git 提交历史补录。
 
+## [0.8.5] - 2026-09-02
+
+### Fixed
+
+- 修复 Library DOM 修改时间诊断不再硬编码单元格索引，依据“修改时间”表头动态定位，并优先读取 `time[datetime]`；文件名等无效文本不再计入可对照样本。
+- 优先选择 `updated_at` 与创建/上传时间不同的高信息量样本；匹配结果保留完整字段 path，并正确标记 ambiguous。
+- 扩展诊断 JSON 递归脱敏，覆盖 `/backend-api/me` 响应及 request/response/body/headers/query 中的身份标识、邮箱、个人资料和 token；Library 诊断所需 ID 与时间字段继续保留。
+
+### Changed
+
+- userscript 与内部 `SCRIPT_VERSION` 升级为 0.8.5；删除语义、创建时间优先级和所有删除流程保持不变。
+
 ## [0.8.4] - 2026-09-01
 
 ### Added

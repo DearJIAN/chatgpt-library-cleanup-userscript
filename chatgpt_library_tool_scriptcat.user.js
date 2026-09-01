@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.4
+// @version      0.8.5
 // @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、时间字段诊断、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -17,7 +17,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.4';
+  const SCRIPT_VERSION = '0.8.5';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -50,7 +50,8 @@
   ];
   const SIZE_KEYS = ['size_bytes', 'sizeBytes', 'file_size_bytes', 'fileSizeBytes', 'size'];
   const SENSITIVE_HEADER_RE = /(?:authorization|cookie|set-cookie|csrf|xsrf|account[-_]?id|session|credential|api[-_]?key|access[-_]?token|refresh[-_]?token|jwt|sentinel)/i;
-  const SENSITIVE_KEY_RE = /(?:^|[_-])(?:token|secret|authorization|cookie|csrf|xsrf|account[_-]?id|session|credential|api[_-]?key|access[_-]?key|password|jwt|sentinel)(?:$|[_-])/i;
+  const SENSITIVE_KEY_RE = /(?:^|[_-])(?:token|secret|authorization|cookie|csrf|xsrf|account[_-]?id|org(?:anization)?[_-]?id|user[_-]?id|device[_-]?id|client[_-]?id|session[_-]?id|credential|api[_-]?key|access[_-]?key|refresh[_-]?token|password|jwt|sentinel|first[_-]?name|last[_-]?name|profile[_-]?name|display[_-]?name|phone[_-]?number|picture|avatar)(?:$|[_-])/i;
+  const SENSITIVE_VALUE_RE = /(?:[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\bBearer\s+[A-Za-z0-9._~+/=-]+\b)/i;
   const SENSITIVE_QUERY_RE = /^(?:token|access_token|refresh_token|authorization|auth|cookie|csrf|xsrf|account_id|account-id|session|api_key|apikey|key|jwt)$/i;
   const FORBIDDEN_REPLAY_HEADER_RE = /^(?:cookie|set-cookie|host|content-length|connection|origin|referer|user-agent|sec-.+|proxy-.+)$/i;
 
@@ -666,7 +667,19 @@
     return Number.isFinite(date.getTime()) ? date.toLocaleString() : '无法解析';
   }
 
-  function matchUiTimeFields(uiText, rawTimes) {
+  function isValidUiModifiedTimeText(value) {
+    const text = String(value || '').trim();
+    let match = /^(\d{1,2}):(\d{2})$/.exec(text);
+    if (match) return Number(match[1]) < 24 && Number(match[2]) < 60;
+    match = /^(\d{1,2})月(\d{1,2})日$/.exec(text);
+    if (match) return Number(match[1]) >= 1 && Number(match[1]) <= 12 && Number(match[2]) >= 1 && Number(match[2]) <= 31;
+    match = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/.exec(text);
+    if (!match) return false;
+    const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+    return date.getFullYear() === Number(match[1]) && date.getMonth() === Number(match[2]) - 1 && date.getDate() === Number(match[3]);
+  }
+
+  function matchUiTimeFields(uiText, rawTimes, uiExact = null) {
     const text = String(uiText || '').trim();
     const now = new Date();
     const matches = [];
@@ -678,6 +691,11 @@
     else if (monthDay) precision = 'low';
     else if (fullDate) precision = 'high';
     const entries = Array.isArray(rawTimes) ? rawTimes : Object.entries(rawTimes || {}).map(([key, value]) => ({ key, path: key, value }));
+    if (uiExact && Number.isFinite(toTimestamp(uiExact))) {
+      const exactMs = toTimestamp(uiExact);
+      const exactMatches = entries.filter((entry) => Number.isFinite(toTimestamp(entry.value)) && Math.abs(toTimestamp(entry.value) - exactMs) <= 2_000).map((entry) => ({ key: entry.key, path: entry.path }));
+      return { uiLikelyMatches: exactMatches, confidence: exactMatches.length === 1 ? 'high' : 'low', ambiguous: exactMatches.length > 1 };
+    }
     for (const entry of entries) {
       const parts = localDateParts(entry.value);
       if (!parts) continue;
@@ -689,12 +707,34 @@
     return { uiLikelyMatches: matches, confidence: matches.length === 1 ? precision : 'low', ambiguous: matches.length > 1 };
   }
 
-  function extractUiModifiedTimeFromRows(rows, record) {
+  function extractUiModifiedTimeFromRows(rows, record, headers = []) {
     const targetId = record?.libraryFileId;
     const targetName = record?.name;
     const row = (rows || []).find((candidate) => candidate && ((targetId && candidate.id === targetId) || (targetName && candidate.name === targetName)));
     if (!row) return { uiModifiedTimeText: null, reason: 'not currently rendered' };
-    return { uiModifiedTimeText: row.modifiedText == null ? null : String(row.modifiedText), reason: row.modifiedText == null ? 'modified time cell unavailable' : null };
+    const columnIndex = (headers || []).findIndex((header) => String(header || '').trim() === '修改时间');
+    if (columnIndex < 0) return { uiModifiedTimeText: null, uiModifiedTimeExact: null, reason: 'modified time column unresolved' };
+    const cell = row.cells?.[columnIndex];
+    const text = typeof cell === 'object' ? cell?.text : cell;
+    const exact = row.exact?.[columnIndex] || (typeof cell === 'object' ? cell?.exact : null) || null;
+    const exactValid = exact && Number.isFinite(toTimestamp(exact));
+    return { uiModifiedTimeText: isValidUiModifiedTimeText(text) ? String(text).trim() : null, uiModifiedTimeExact: exactValid ? String(exact) : null, reason: (isValidUiModifiedTimeText(text) || exactValid) ? null : 'modified time value unresolved' };
+  }
+
+  function selectTimeDiagnosticSamples(records, limit = 10, visibleIds = []) {
+    const visible = new Set(visibleIds || []);
+    const valueOf = (record, key) => (record.rawTimeEntries || []).find((entry) => entry.key === key)?.value;
+    return (records || []).filter((record) => validateDeletionTarget(record).valid && !record.externalProvider).sort((a, b) => {
+      const score = (record) => {
+        const creation = valueOf(record, 'record_creation_time');
+        const upload = valueOf(record, 'file_upload_time');
+        const updated = valueOf(record, 'updated_at');
+        return (updated != null && creation != null && String(updated) !== String(creation) ? 1000 : 0) +
+          (updated != null && upload != null && String(updated) !== String(upload) ? 500 : 0) +
+          (visible.has(record.libraryFileId) ? 50 : 0) + (record.parentDirectoryId ? 10 : 0);
+      };
+      return score(b) - score(a);
+    }).slice(0, Math.max(1, Math.min(10, limit)));
   }
 
   function sanitizeTimeDiagnostics(items) {
@@ -705,7 +745,7 @@
       rawTimes: Object.fromEntries(Object.entries(item.rawTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
       rawTimeEntries: (item.rawTimeEntries || []).filter((entry) => RAW_TIME_KEYS.includes(entry.key)).map((entry) => ({ key: entry.key, path: entry.path, value: entry.value })),
       parsedLocalTimes: Object.fromEntries(Object.entries(item.parsedLocalTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
-      uiModifiedTimeText: item.uiModifiedTimeText ?? null, uiLikelyMatches: item.uiLikelyMatches || [], confidence: item.confidence || 'low',
+      uiModifiedTimeText: item.uiModifiedTimeText ?? null, uiModifiedTimeExact: item.uiModifiedTimeExact ?? null, uiLikelyMatches: item.uiLikelyMatches || [], confidence: item.confidence || 'low', ambiguous: Boolean(item.ambiguous), reason: item.reason || null,
     }));
   }
 
@@ -714,7 +754,7 @@
     for (const item of items) {
       const source = item.createdAtSource || 'unknown';
       summary.createdAtSources[source] = (summary.createdAtSources[source] || 0) + 1;
-      if (item.uiModifiedTimeText) summary.uiComparableCount += 1;
+      if (isValidUiModifiedTimeText(item.uiModifiedTimeText) || (item.uiModifiedTimeExact && Number.isFinite(toTimestamp(item.uiModifiedTimeExact)))) summary.uiComparableCount += 1;
       if (item.ambiguous) summary.ambiguous += 1;
       else if (item.uiLikelyMatches?.length === 1) {
         const key = item.uiLikelyMatches[0].key || item.uiLikelyMatches[0];
@@ -888,9 +928,12 @@
     validateDeletionTarget,
     findScalarWithSourceByKeys,
     collectRawTimeFields,
+    isValidUiModifiedTimeText,
     matchUiTimeFields,
     extractUiModifiedTimeFromRows,
+    selectTimeDiagnosticSamples,
     sanitizeTimeDiagnostics,
+    sanitizeJson,
     createDeleteQueue,
     runDeleteQueuePipeline,
     runVerificationPasses,
@@ -969,36 +1012,43 @@
   function sanitizeHeaders(source) {
     const out = {};
     for (const [key, value] of Object.entries(headersToObject(source))) {
-      out[key] = SENSITIVE_HEADER_RE.test(key) ? REDACTED : value;
+      out[key] = SENSITIVE_HEADER_RE.test(key) || (typeof value === 'string' && SENSITIVE_VALUE_RE.test(value)) ? REDACTED : value;
     }
     return out;
   }
 
-  function sanitizeJson(value, seen = new WeakSet(), depth = 0) {
+  function sanitizeJson(value, seen = new WeakSet(), depth = 0, options = {}) {
     if (value == null) return value;
-    if (typeof value === 'string') return /^https?:\/\//i.test(value) ? sanitizeUrl(value) : value;
+    if (typeof value === 'string') {
+      if (SENSITIVE_VALUE_RE.test(value)) return REDACTED;
+      return /^https?:\/\//i.test(value) ? sanitizeUrl(value) : value;
+    }
     if (typeof value !== 'object') return value;
     if (seen.has(value)) return '[Circular]';
     if (depth > 7) return Array.isArray(value) ? `[Array(${value.length})]` : '[Object]';
     seen.add(value);
     if (Array.isArray(value)) {
-      const result = value.slice(0, 6).map((item) => sanitizeJson(item, seen, depth + 1));
+      const result = value.slice(0, 6).map((item) => sanitizeJson(item, seen, depth + 1, options));
       if (value.length > 6) result.push(`[... ${value.length - 6} more]`);
       return result;
     }
     const out = {};
     const entries = Object.entries(value);
     for (const [key, child] of entries.slice(0, 100)) {
-      out[key] = SENSITIVE_KEY_RE.test(key) ? REDACTED : sanitizeJson(child, seen, depth + 1);
+      const redactProfileIdentity = options.redactProfileNames && /^(?:id|name|full_name)$/i.test(key);
+      out[key] = SENSITIVE_KEY_RE.test(key) || redactProfileIdentity ? REDACTED : sanitizeJson(child, seen, depth + 1, options);
     }
     if (entries.length > 100) out.__truncated_keys__ = entries.length - 100;
     return out;
   }
 
-  function summarizeTextBody(text) {
+  function summarizeTextBody(text, options = {}) {
     if (!text) return null;
-    try { return sanitizeJson(JSON.parse(text)); }
-    catch (_) { return text.length > 1200 ? `${text.slice(0, 1200)}…[truncated]` : text; }
+    try { return sanitizeJson(JSON.parse(text), new WeakSet(), 0, options); }
+    catch (_) {
+      if (SENSITIVE_VALUE_RE.test(text)) return REDACTED;
+      return text.length > 1200 ? `${text.slice(0, 1200)}…[truncated]` : text;
+    }
   }
 
   function eventSignature(event) {
@@ -1016,6 +1066,8 @@
     state.rawEvents.push(rawEvent);
     if (state.rawEvents.length > MAX_EVENTS) state.rawEvents.splice(0, state.rawEvents.length - MAX_EVENTS);
 
+    const identityEndpoint = /\/backend-api\/me(?:[/?]|$)/i.test(rawEvent.request?.url || '');
+    const identityOptions = identityEndpoint ? { redactProfileNames: true } : {};
     if (state.captureEnabled) {
       state.diagnostics.push({
         id: rawEvent.id,
@@ -1030,7 +1082,7 @@
         response: {
           status: rawEvent.response?.status,
           headers: sanitizeHeaders(rawEvent.response?.headers || {}),
-          body: rawEvent.response?.json ? sanitizeJson(rawEvent.response.json) : summarizeTextBody(rawEvent.response?.text || ''),
+          body: rawEvent.response?.json ? sanitizeJson(rawEvent.response.json, new WeakSet(), 0, identityOptions) : summarizeTextBody(rawEvent.response?.text || '', identityOptions),
         },
         extracted_file_count: rawEvent.records.length,
       });
@@ -1824,21 +1876,25 @@
       root.alert('当前没有扫描记录，请先执行“自动扫描全部”或扫描一部分。');
       return;
     }
-    const candidates = [...state.scan.records.values()]
-      .filter((record) => validateDeletionTarget(record).valid && !record.externalProvider)
-      .sort((a, b) => Number(Object.keys(b.rawTimes || {}).length > 1) - Number(Object.keys(a.rawTimes || {}).length > 1))
-      .slice(0, 10);
+    const header = root.document.querySelector('[data-testid="artifacts-surface-library-list-header"], [data-page-table-list-header]');
+    const headers = header ? [...header.children].map((child) => child.innerText?.trim() || '') : [];
     const rows = [...root.document.querySelectorAll('[role="row"]')].map((row) => {
       const cells = [...row.querySelectorAll('[role="gridcell"]')];
       return {
         id: row.getAttribute('data-page-table-selection-id'),
-        name: cells[0]?.innerText?.trim() || '',
-        modifiedText: cells[1]?.innerText?.trim() || null,
+        name: cells[1]?.innerText?.trim() || '',
+        cells: cells.map((cell) => ({
+          text: cell.innerText?.trim() || '',
+          exact: cell.querySelector('time[datetime]')?.getAttribute('datetime') ||
+            cell.getAttribute('datetime') || cell.getAttribute('title') || cell.getAttribute('aria-label') ||
+            cell.querySelector('[title]')?.getAttribute('title') || cell.querySelector('[aria-label]')?.getAttribute('aria-label') || null,
+        })),
       };
     });
+    const candidates = selectTimeDiagnosticSamples([...state.scan.records.values()], 10, rows.map((row) => row.id));
     state.timeFieldDiagnostics = candidates.map((record) => {
-      const ui = extractUiModifiedTimeFromRows(rows, record);
-      const match = ui.uiModifiedTimeText ? matchUiTimeFields(ui.uiModifiedTimeText, record.rawTimeEntries || record.rawTimes) : { uiLikelyMatches: [], confidence: 'low', ambiguous: false };
+      const ui = extractUiModifiedTimeFromRows(rows, record, headers);
+      const match = (ui.uiModifiedTimeText || ui.uiModifiedTimeExact) ? matchUiTimeFields(ui.uiModifiedTimeText, record.rawTimeEntries || record.rawTimes, ui.uiModifiedTimeExact) : { uiLikelyMatches: [], confidence: 'low', ambiguous: false };
       return { fileName: record.name, libraryFileId: record.libraryFileId, parentDirectoryId: record.parentDirectoryId, createdAt: record.createdAt, createdAtSource: record.createdAtSource, createdAtPath: record.createdAtPath, rawTimes: record.rawTimes, rawTimeEntries: record.rawTimeEntries, parsedLocalTimes: Object.fromEntries((record.rawTimeEntries || []).map((entry) => [entry.path, localTimeText(entry.value)])), uiModifiedTimeText: ui.uiModifiedTimeText, reason: ui.reason, ...match };
     });
     const pre = root.document.getElementById('cgpt-lib-tool-time-diagnostic');

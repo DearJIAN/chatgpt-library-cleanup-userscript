@@ -344,6 +344,28 @@ test('UI row extraction returns null when the record is not currently rendered',
   assert.deepEqual(tool.extractUiModifiedTimeFromRows([{ id: 'other', name: 'other.txt', modifiedText: '8月1日' }], { libraryFileId: 'libfile_missing', name: 'missing.txt' }), { uiModifiedTimeText: null, reason: 'not currently rendered' });
 });
 
+test('UI modified time uses the header-resolved column and exact timestamp first', () => {
+  const result = tool.extractUiModifiedTimeFromRows([
+    { id: 'libfile_ui', name: 'ui.png', cells: ['ui.png', '73.8 KB', '22:31', 'menu'], exact: [null, null, '2026-09-01T14:31:15.000Z', null] },
+  ], { libraryFileId: 'libfile_ui', name: 'ui.png' }, ['名称', '大小', '修改时间', '操作']);
+  assert.equal(result.uiModifiedTimeText, '22:31');
+  assert.equal(result.uiModifiedTimeExact, '2026-09-01T14:31:15.000Z');
+});
+
+test('invalid filename-like UI text is not comparable', () => {
+  assert.equal(tool.isValidUiModifiedTimeText('7a437066-abc.png'), false);
+  assert.equal(tool.isValidUiModifiedTimeText('22:31'), true);
+  assert.equal(tool.isValidUiModifiedTimeText('8月18日'), true);
+});
+
+test('time diagnostic samples prioritize differing update and creation times', () => {
+  const records = [
+    { libraryFileId: 'libfile_same', fileId: 'file_same', createdAt: '2026-08-01Z', rawTimeEntries: [{ key: 'record_creation_time', path: 'record_creation_time', value: '2026-08-01Z' }, { key: 'updated_at', path: 'updated_at', value: '2026-08-01Z' }] },
+    { libraryFileId: 'libfile_diff', fileId: 'file_diff', createdAt: '2026-08-01Z', rawTimeEntries: [{ key: 'record_creation_time', path: 'record_creation_time', value: '2026-08-01Z' }, { key: 'updated_at', path: 'updated_at', value: '2026-08-18Z' }] },
+  ];
+  assert.equal(tool.selectTimeDiagnosticSamples(records, 1)[0].libraryFileId, 'libfile_diff');
+});
+
 test('time diagnostic export contains no sensitive fields', () => {
   const safe = tool.sanitizeTimeDiagnostics([{ fileName: 'a.txt', rawTimes: { updated_at: 'x', Authorization: 'secret', email: 'x@y.test' }, uiModifiedTimeText: null }]);
   assert.equal(JSON.stringify(safe).includes('secret'), false);
@@ -386,15 +408,39 @@ test('UI matches include full paths and ambiguous entries', () => {
   ]);
 });
 
-test('userscript metadata is 0.8.4 and points update/download to the public raw file', () => {
+test('userscript metadata is 0.8.5 and points update/download to the public raw file', () => {
   const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
   const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
   const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
   const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
-  assert.equal(version, '0.8.4');
+  assert.equal(version, '0.8.5');
   assert.equal(scriptVersion, version);
   assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, /^\/\/ @homepageURL\s+https:\/\/github\.com\/DearJIAN\/chatgpt-library-cleanup-userscript$/m);
   assert.match(source, /^\/\/ @supportURL\s+https:\/\/github\.com\/DearJIAN\/chatgpt-library-cleanup-userscript\/issues$/m);
+});
+
+test('recursive diagnostic sanitizer redacts identity fields but preserves library diagnosis fields', () => {
+  const result = tool.sanitizeJson({
+    email: 'person@example.com', user_id: 'u-1', account_id: 'a-1', device_id: 'd-1', session_id: 's-1', org_id: 'o-1', client_id: 'c-1',
+    profile: { name: 'Person', picture: 'https://example.com/avatar.jpg' },
+    nested: { response: { phone_number: '123', access_token: 'secret' } },
+    libraryFileId: 'libfile_keep', fileId: 'file_keep', fileName: 'keep.txt', parentDirectoryId: 'root', updated_at: '2026-08-01T00:00:00Z',
+  });
+  const text = JSON.stringify(result);
+  assert.equal(text.includes('person@example.com'), false);
+  assert.equal(text.includes('u-1'), false);
+  assert.equal(text.includes('avatar.jpg'), false);
+  assert.equal(result.libraryFileId, 'libfile_keep');
+  assert.equal(result.fileId, 'file_keep');
+  assert.equal(result.fileName, 'keep.txt');
+  assert.equal(result.updated_at, '2026-08-01T00:00:00Z');
+});
+
+test('profile name is redacted in /backend-api/me-shaped payloads', () => {
+  const result = tool.sanitizeJson({ id: 'u-1', name: 'Person', email: 'person@example.com' }, new WeakSet(), 0, { redactProfileNames: true });
+  assert.equal(result.id, '[REDACTED]');
+  assert.equal(result.name, '[REDACTED]');
+  assert.equal(result.email, '[REDACTED]');
 });
