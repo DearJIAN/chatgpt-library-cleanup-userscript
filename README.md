@@ -50,7 +50,7 @@ chatgpt_library_tool_scriptcat.user.js
 
 下面是脚本在 ChatGPT Library 中真实运行时的界面示例。截图中的文件数量、日期和删除进度仅用于说明界面，实际数值会随你的 Library 内容变化。
 
-![ChatGPT Library Cleanup Userscript 运行界面](docs/images/library-tool-panel.jpg)
+![ChatGPT Library Cleanup Userscript 运行界面](docs/images/library-tool-panel.png)
 
 面板中的主要信息包括：
 
@@ -200,7 +200,7 @@ POST /backend-api/files/library/files/{library_file_id}/delete_stream
 │  └─ library_tool.test.cjs                 # Node.js 测试
 ├─ docs/
 │  └─ images/
-│     └─ library-tool-panel.jpg             # README 界面示例
+│     └─ library-tool-panel.png             # README 界面示例
 ├─ README.md                                # 使用说明
 ├─ CHANGELOG.md                             # 版本变更记录
 └─ LICENSE                                  # MIT License
