@@ -2,16 +2,16 @@
 
 一个用于 **ChatGPT Library（资料库）** 的 ScriptCat / Tampermonkey 用户脚本，可后台扫描 Library 目录树，并按指定截止日期批量执行 soft delete。
 
-> 当前版本：**0.8.5**
+> 当前版本：**0.8.5**  
 > 适用页面：`https://chatgpt.com/library`
 
 ## 为什么做这个项目？
 
-ChatGPT Library 在长期使用后很容易积累大量上传文件和图片。当文件数量达到数千个时，如果想清理较早的历史文件，官方界面目前主要依赖逐项加载和手动操作，处理大量旧文件会非常耗时。
+ChatGPT Library 在长期使用后很容易积累大量上传文件和图片。当文件数量达到数千个时，如果想清理较早的历史文件，官方界面主要依赖逐项加载和手动操作，处理大量旧文件会非常耗时。
 
 这个项目最初就是为了解决这个问题：希望能够按照一个明确的截止日期，自动扫描 ChatGPT Library 中的本地文件，并安全、快速地清理较早的历史文件，而不影响较新的文件以及 Google Drive 等外部来源。
 
-在实际开发过程中，ChatGPT Library 的目录结构、cursor 分页、文件 ID、删除接口等都经历了多轮验证和修正，因此脚本最终采用了“目录树递归 × 每目录 cursor 分页”、soft delete、首次单文件验证、fail-closed 和补漏扫描等机制，尽可能降低批量清理时的误删风险。
+在实际开发过程中，ChatGPT Library 的目录结构、cursor 分页、文件 ID、删除接口等都经历了多轮验证和修正，因此脚本采用了“目录树递归 × 每目录 cursor 分页”、soft delete、首次单文件验证、fail-closed 和补漏扫描等机制，尽可能降低批量清理时的误删风险。
 
 ## 功能
 
@@ -27,8 +27,8 @@ ChatGPT Library 在长期使用后很容易积累大量上传文件和图片。�
 - 流式清理完成后最多执行 3 轮从 ROOT 重新开始的 verification scan，用于补漏；
 - 排除 Google Drive / external 项、文件夹、日期未知项目和身份字段不完整的文件；
 - 支持随时停止；停止后不再领取新任务，已经发出的请求允许自然结束；
-- 支持复制 / 下载脱敏诊断 JSON。
-- 新增“诊断时间字段”：只读保留 nodes 响应中的原始时间字段，并与当前 DOM 可见的“修改时间”进行弱匹配；不自动改变删除日期语义。
+- 支持复制 / 下载脱敏诊断 JSON；
+- 支持“诊断时间字段”：保留 nodes 响应中的原始时间字段，并与当前 DOM 可见的“修改时间”进行对照，不自动改变删除日期语义。
 
 ## 安装
 
@@ -37,27 +37,82 @@ ChatGPT Library 在长期使用后很容易积累大量上传文件和图片。�
 - ScriptCat
 - Tampermonkey
 
-然后安装本仓库中的：
+### 推荐方式：从 GitHub Raw 直接安装
+
+**不要把“新建脚本 → 复制源码 → 保存”作为常规安装方式。** 这种方式可能被 ScriptCat 识别为“本地脚本”，即使源码里存在 `@updateURL` / `@downloadURL`，也可能没有建立正常的远程更新来源。
+
+推荐直接在浏览器中打开下面这个 `.user.js` 地址：
 
 ```text
-chatgpt_library_tool_scriptcat.user.js
+https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js
 ```
 
-对于私有仓库，可以在 GitHub 打开该文件后复制源码，新建一个 ScriptCat / Tampermonkey 脚本并粘贴保存。
+ScriptCat / Tampermonkey 会自动识别 Userscript，并弹出安装或更新页面。确认后点击安装 / 更新即可。
+
+安装成功后，建议在 ScriptCat 的脚本列表中检查“来源”一栏：
+
+```text
+脚本链接
+```
+
+而不是：
+
+```text
+本地脚本
+```
+
+如果已经通过复制源码的方式安装了旧版本，可以直接打开上面的 GitHub Raw `.user.js` 地址。只要 `@name` / `@namespace` 能匹配现有脚本，ScriptCat 通常会显示版本差异，并允许直接覆盖更新现有脚本。
+
+> 当前仓库为 public，因此无需额外服务器，也无需手动下载文件；GitHub Raw 就可以直接作为安装源和更新源。
 
 ## 自动更新
 
-本脚本支持 ScriptCat / Tampermonkey 从 GitHub Raw 检查更新。
+脚本内置：
 
-更新地址：
+```text
+@updateURL
+@downloadURL
+@homepageURL
+@supportURL
+```
 
-`https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js`
+其中更新与下载地址均指向完整的 GitHub Raw `.user.js`：
 
-旧版本尚未包含自动更新 metadata，首次需要手动安装或覆盖安装一次 0.8.4 或更高版本。此后，脚本管理器会按自己的检查周期读取 `@updateURL`，并通过 `@downloadURL` 获取完整 `.user.js` 文件。
+```text
+https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js
+```
 
-只有 GitHub 上的 `@version` 提高时，ScriptCat / Tampermonkey 才会判断有新版本；GitHub 新 commit 本身不会自动触发脚本更新。
+**首次必须通过远程 `.user.js` 链接安装 / 覆盖安装一次。** 之后 ScriptCat / Tampermonkey 才能把这份脚本作为“脚本链接”管理，并按自己的更新检查周期读取 `@updateURL`、通过 `@downloadURL` 获取完整新版。
 
-版本策略：纯 README、图片、CHANGELOG 或 LICENSE 变化不需要提升 userscript 版本；脚本行为或功能变化必须提升 `@version`。小 bug 可递增 patch（如 `0.8.4` → `0.8.5`），明显新功能可进入下一个 minor 版本，不兼容变化进入 major 版本。
+更新链路如下：
+
+```text
+修改 userscript
+    ↓
+提高 @version / SCRIPT_VERSION
+    ↓
+git commit + push main
+    ↓
+GitHub Raw 指向 main 最新脚本
+    ↓
+ScriptCat 检查 @updateURL
+    ↓
+发现远端版本高于本地
+    ↓
+通过 @downloadURL 更新脚本
+```
+
+需要注意：
+
+- GitHub 出现新 commit **不等于** ScriptCat 一定认为有新版本；
+- 真正发布脚本功能或行为变化时，必须同步提高 `@version`；
+- `@version` 与内部 `SCRIPT_VERSION` 必须保持一致；
+- README、图片、CHANGELOG、LICENSE 等纯文档修改，不需要提升 userscript 版本；
+- 小 bug 可递增 patch（如 `0.8.5` → `0.8.6`）；
+- 明显新功能可进入下一个 minor 版本；
+- 不兼容的大变化再考虑 major 版本。
+
+如果 ScriptCat 中“来源”仍显示“本地脚本”，优先重新通过 GitHub Raw `.user.js` 地址覆盖安装一次，而不是继续手动粘贴源码。
 
 ## 使用方法
 
@@ -116,7 +171,7 @@ Library
 - **删除已扫描旧文件**：如果扫描中途停止，只处理当前已经扫描到的记录；
 - **停止**：停止继续扫描和领取新的删除任务；
 - **复制诊断 JSON / 下载诊断 JSON**：导出已经脱敏的诊断信息；
-- **诊断时间字段**：对照当前已扫描记录、后台原始时间字段和当前渲染的“修改时间”；不在 DOM 中的文件会标记为未渲染。
+- **诊断时间字段**：对照当前已扫描记录、后台原始时间字段和当前渲染的“修改时间”；
 - **清空诊断日志**：清除面板内累计的诊断事件；
 - **关闭**：隐藏工具面板。
 
