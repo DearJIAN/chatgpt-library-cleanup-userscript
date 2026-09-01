@@ -113,17 +113,33 @@ test('fails closed when directory or total request safety limits are exceeded', 
 });
 
 test('selects strict cutoff, preserves unknown dates and external files', () => {
-  const cutoff = tool.localCutoffMs('2026-08-01');
+  const cutoff = tool.inclusiveCutoffExclusiveEndMs('2026-08-01');
   const records = [
     { libraryFileId: 'libfile_old', fileId: 'file_old', createdAt: '2026-07-31T15:59:59Z' },
-    { libraryFileId: 'libfile_edge', fileId: 'file_edge', createdAt: '2026-07-31T16:00:00Z' },
+    { libraryFileId: 'libfile_edge', fileId: 'file_edge', createdAt: '2026-08-01T12:00:00' },
     { libraryFileId: 'libfile_unknown', fileId: 'file_unknown', createdAt: null },
     { libraryFileId: 'libfile_external', fileId: 'file_external', createdAt: '2020-01-01Z', externalProvider: 'google_drive' },
   ];
   const selection = tool.selectDeletionTargets(records, cutoff);
-  assert.deepEqual(selection.targets.map(x => x.libraryFileId), ['libfile_old']);
+  assert.deepEqual(selection.targets.map(x => x.libraryFileId), ['libfile_old', 'libfile_edge']);
   assert.equal(selection.unknownDateCount, 1);
   assert.equal(selection.externalCount, 1);
+});
+
+test('inclusive cutoff deletes every instant on the selected date but not the next date', () => {
+  const end = tool.inclusiveCutoffExclusiveEndMs('2026-08-01');
+  const values = [
+    '2026-07-31T23:59:59.000', '2026-08-01T00:00:00.000',
+    '2026-08-01T12:00:00.000', '2026-08-01T23:59:59.999',
+    '2026-08-02T00:00:00.000', '2026-08-02T12:00:00.000',
+  ];
+  assert.deepEqual(values.map((value) => tool.toTimestamp(value) < end), [true, true, true, true, false, false]);
+});
+
+test('partial scan records are eligible for the scanned-records delete action', () => {
+  assert.equal(tool.canDeleteScannedRecords({ scanning: false, deleting: false, recordCount: 1200 }), true);
+  assert.equal(tool.canDeleteScannedRecords({ scanning: false, deleting: false, recordCount: 0 }), false);
+  assert.equal(tool.canDeleteScannedRecords({ scanning: true, deleting: false, recordCount: 1200 }), false);
 });
 
 test('builds soft-delete URL with parent directory and stable IDs', () => {

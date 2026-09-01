@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.2
+// @version      0.8.3
 // @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -13,7 +13,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.2';
+  const SCRIPT_VERSION = '0.8.3';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -572,13 +572,16 @@
     return findNumericByNormalizedKeys(payload, ['totalcount', 'totalfiles', 'totalitems', 'total']);
   }
 
-  function localCutoffMs(dateString) {
+  function inclusiveCutoffExclusiveEndMs(dateString) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dateString)) throw new Error('截止日期格式必须是 YYYY-MM-DD。');
     const [year, month, day] = dateString.split('-').map(Number);
-    const date = new Date(year, month - 1, day, 0, 0, 0, 0);
-    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) throw new Error('截止日期无效。');
+    const selected = new Date(year, month - 1, day, 0, 0, 0, 0);
+    if (selected.getFullYear() !== year || selected.getMonth() !== month - 1 || selected.getDate() !== day) throw new Error('截止日期无效。');
+    const date = new Date(year, month - 1, day + 1, 0, 0, 0, 0);
     return date.getTime();
   }
+
+  const localCutoffMs = inclusiveCutoffExclusiveEndMs;
 
   function toTimestamp(value) {
     if (typeof value === 'number') {
@@ -611,6 +614,10 @@
     }
     targets.sort((a, b) => toTimestamp(a.createdAt) - toTimestamp(b.createdAt));
     return { targets, unknownDateCount, externalCount };
+  }
+
+  function canDeleteScannedRecords({ scanning, deleting, recordCount } = {}) {
+    return !scanning && !deleting && Number(recordCount) > 0;
   }
 
   function buildDeleteUrl(record) {
@@ -735,6 +742,8 @@
     learnPaginationFromEvents,
     applyPaginationRule,
     localCutoffMs,
+    inclusiveCutoffExclusiveEndMs,
+    canDeleteScannedRecords,
     selectDeletionTargets,
     buildDeleteUrl,
     chooseScanSeed,
@@ -1459,7 +1468,7 @@
       const first = await queue.waitForItem();
       const firstWaitScanResult = first ? null : await scanPromise;
       if (!first) {
-        if (firstWaitScanResult) root.alert(`扫描完整，但没有发现创建时间早于 ${dateText} 的可删除本地文件。`);
+        if (firstWaitScanResult) root.alert(`扫描完整，但没有发现创建日期在 ${dateText} 当天及以前的可删除本地文件。`);
         return;
       }
       state.deleting = true;
@@ -1529,10 +1538,10 @@
     }
   }
 
-  async function startDeleteAfterComplete() {
+  async function startDeleteScannedRecords() {
     if (state.scanning || state.deleting) return;
-    if (!state.scan.complete) {
-      root.alert('为了避免漏删/误判，必须先完成“自动扫描全部”。当前扫描尚未确认完整。');
+    if (!canDeleteScannedRecords({ scanning: state.scanning, deleting: state.deleting, recordCount: state.scan.records.size })) {
+      root.alert('当前没有可删除的已扫描记录，或扫描/删除任务仍在运行。');
       return;
     }
 
@@ -1541,7 +1550,7 @@
     const dateText = String(dateInput?.value || DEFAULT_CUTOFF).trim();
     const concurrency = Number(concurrencyInput?.value || DEFAULT_CONCURRENCY);
     let cutoffMs;
-    try { cutoffMs = localCutoffMs(dateText); }
+    try { cutoffMs = inclusiveCutoffExclusiveEndMs(dateText); }
     catch (error) { root.alert(error.message); return; }
     if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
       root.alert(`并发数必须是 1～${MAX_CONCURRENCY} 的整数。`);
@@ -1552,7 +1561,9 @@
     const selection = selectDeletionTargets(records, cutoffMs);
     const targets = selection.targets;
     if (!targets.length) {
-      root.alert(`完整扫描后，没有发现创建时间早于 ${dateText} 的可删除本地 Library 文件。`);
+      root.alert(state.scan.complete
+        ? `完整扫描后，没有发现创建日期在 ${dateText} 当天及以前的可删除本地 Library 文件。`
+        : `当前已扫描范围内没有发现创建日期在 ${dateText} 当天及以前的可删除本地 Library 文件。未扫描部分不会处理。`);
       return;
     }
     const invalidTarget = targets.map((record, index) => ({ record, index, validation: validateDeletionTarget(record) }))
@@ -1573,12 +1584,12 @@
     const bytes = targets.reduce((sum, record) => sum + (Number(record.sizeBytes) || 0), 0);
     const confirmed = root.confirm(
       `ChatGPT Library 高速清理\n\n` +
-      `完整扫描：${records.length} 个 Library 文件记录\n` +
+      (state.scan.complete ? `完整扫描：${records.length} 个 Library 文件记录\n` : `当前扫描未完整。\n本次仅删除已经扫描到的 ${records.length} 个记录中的 ${targets.length} 个符合条件文件。\n未扫描部分不会处理。\n`) +
       `将删除：${targets.length} 个\n` +
       `日期未知（保留）：${selection.unknownDateCount} 个\n` +
       `外部/Google Drive（保留）：${selection.externalCount} 个\n` +
       `估算体积：${formatBytes(bytes)}\n` +
-      `规则：创建时间 < ${dateText} 本地 00:00\n` +
+      `规则：删除创建日期在 ${dateText} 当天及以前的文件；${dateText} 次日及以后保留。\n` +
       `并发：${concurrency}\n\n` +
       '使用 soft delete，文件会先进入 Recently deleted。\n\n确定开始吗？',
     );
@@ -1592,6 +1603,13 @@
       await deleteOne(targets[0]);
       let deleted = 1;
       updateDeleteProgress(deleted, 0, targets.length);
+      if (!state.deleteSchemaVerifiedForSession) {
+        const verified = root.confirm(
+          `首个 soft-delete 请求已成功返回。\n\n测试文件：\n文件名：${targets[0].name || '[未知]'}\nLibrary ID：${targets[0].libraryFileId}\n\n请确认该文件已经从 ChatGPT Library 主列表中消失。\n\n是否继续批量删除？`,
+        );
+        if (!verified) { state.stopRequested = true; return; }
+        state.deleteSchemaVerifiedForSession = true;
+      }
       if (state.stopRequested || targets.length === 1) {
         root.alert(`已停止/完成探测删除：成功 ${deleted} 个。`);
         return;
@@ -1608,7 +1626,9 @@
         console.error('[ChatGPT Library 工具] 删除失败：', result.failed);
         root.alert(`本轮结束。\n\n成功删除：${deleted}\n失败：${result.failed.length}\n\n失败详情已输出到控制台。`);
       } else {
-        root.alert(`完成：成功软删除 ${deleted} 个旧文件。\n\n文件目前位于 Recently deleted。`);
+        root.alert(state.scan.complete
+          ? `已删除当前已扫描范围内的目标文件。\n\n成功软删除：${deleted} 个。`
+          : `已删除当前已扫描范围内的目标文件。\n\n成功软删除：${deleted} 个。未扫描部分未处理。`);
       }
       state.scan.complete = false;
       state.scan.warning = '删除后列表已变化，请刷新页面并重新扫描。';
@@ -1730,8 +1750,8 @@
       const cutoff = root.document.getElementById('cgpt-lib-tool-cutoff')?.value;
       if (state.deleteQueue) {
         preview = `将删除：${state.deleteQueue.snapshot().queuedCount} 个文件（队列中/已发现）`;
-      } else if (state.scan.complete && cutoff) {
-        try { preview = `将删除：${selectDeletionTargets([...state.scan.records.values()], localCutoffMs(cutoff)).targets.length} 个文件`; }
+      } else if (state.scan.records.size > 0 && cutoff) {
+        try { preview = `将删除：${selectDeletionTargets([...state.scan.records.values()], inclusiveCutoffExclusiveEndMs(cutoff)).targets.length} 个文件（已扫描范围）`; }
         catch (_) { preview = '将删除：截止日期无效'; }
       }
       targetPreview.textContent = preview;
@@ -1746,7 +1766,7 @@
       else status.textContent = '等待操作。首次安装后建议刷新一次 Library 页面。';
     }
     if (scanBtn) scanBtn.disabled = state.scanning || state.deleting;
-    if (deleteBtn) deleteBtn.disabled = state.scanning || state.deleting || !state.scan.complete;
+    if (deleteBtn) deleteBtn.disabled = !canDeleteScannedRecords({ scanning: state.scanning, deleting: state.deleting, recordCount: state.scan.records.size });
     if (pipelineBtn) pipelineBtn.disabled = state.scanning || state.deleting;
     if (stopBtn) stopBtn.disabled = !state.scanning && !state.deleting;
   }
@@ -1799,13 +1819,13 @@
       </div>
       <div id="cgpt-lib-tool-status" style="padding:8px 9px;background:#1f2937;border-radius:8px;margin-bottom:10px">等待操作。</div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
-        <label style="flex:1">删除日期之前：<input id="cgpt-lib-tool-cutoff" type="date" value="${DEFAULT_CUTOFF}" style="width:145px;margin-left:5px"></label>
+        <label style="flex:1">删除截至日期（含当天）：<input id="cgpt-lib-tool-cutoff" type="date" value="${DEFAULT_CUTOFF}" style="width:145px;margin-left:5px"></label>
         <label>并发：<input id="cgpt-lib-tool-concurrency" type="number" min="1" max="${MAX_CONCURRENCY}" value="${DEFAULT_CONCURRENCY}" style="width:55px;margin-left:4px"></label>
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:8px">
         <button data-act="scan">自动扫描全部</button>
         <button data-act="pipeline">扫描并删除旧文件</button>
-        <button data-act="delete" disabled>删除旧文件</button>
+        <button data-act="delete" disabled>删除已扫描旧文件</button>
         <button data-act="stop" disabled>停止</button>
         <button data-act="copy">复制诊断 JSON</button>
         <button data-act="download">下载诊断 JSON</button>
@@ -1832,7 +1852,7 @@
       const action = target.dataset.act;
       if (action === 'scan') autoScanAll();
       else if (action === 'pipeline') startDelete();
-      else if (action === 'delete') startDelete();
+      else if (action === 'delete') startDeleteScannedRecords();
       else if (action === 'stop') stopCurrent();
       else if (action === 'copy') {
         try { await copyText(JSON.stringify(diagnosticBundle(), null, 2)); root.alert('诊断 JSON 已复制。'); }
