@@ -2,6 +2,10 @@
 
 一个用于 **ChatGPT Library（资料库）** 的 ScriptCat / Tampermonkey 用户脚本，可后台扫描 Library 目录树，并按指定截止日期批量执行 soft delete。
 
+> **[🚀 点击安装 ScriptCat 用户脚本](https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js)**
+>
+> 建议直接通过 GitHub Raw 安装；安装后在 ScriptCat 中“来源”应显示为 **脚本链接**，而不是“本地脚本”。
+
 > 当前版本：**0.8.5**  
 > 适用页面：`https://chatgpt.com/library`
 
