@@ -52,6 +52,34 @@ chatgpt_library_tool_scriptcat.user.js
 
 ![ChatGPT Library Cleanup Userscript 运行界面](docs/images/library-tool-panel.png)
 
+### 扫描与删除范围（重要）
+
+> **请注意：本地项目文件夹并不是“保护区”。** 脚本会递归进入所有本地 Library 文件夹 / 项目目录；项目内部的文件只要满足截止日期和安全校验，也会进入 soft-delete 队列。
+
+具体范围如下：
+
+- **Library 根目录中的普通文件**：会扫描；满足截止日期条件时会删除；
+- **本地项目 / 文件夹中的文件**：会递归扫描；满足截止日期条件时同样会删除；
+- **本地文件夹本身**：不会被脚本删除；
+- **Google Drive / external 目录及其内部内容**：整棵目录树都会被忽略，不扫描、不删除；
+- **日期未知、身份字段异常或无法确认来源的项目**：默认保留。
+
+例如：
+
+```text
+Library
+├─ old-root-file.pdf            # 根目录文件：可能删除
+├─ 论文/
+│  ├─ old-paper.pdf             # 项目内文件：可能删除
+│  └─ new-paper.pdf             # 超过截止日期：保留
+├─ PPT/
+│  └─ old-slide.pptx            # 项目内文件：可能删除
+└─ Google Drive/                # 整棵树忽略
+   └─ any-file.pdf              # 不扫描、不删除
+```
+
+也就是说，截止日期判断针对的是**每一个文件自己的创建 / 上传时间**，而不是它所在文件夹在界面上显示的“修改时间”。
+
 面板中的主要信息包括：
 
 - **捕获请求**：当前页面已捕获到的 Library 相关网络请求数量；
@@ -169,6 +197,8 @@ https://chatgpt.com/library
 - 文件必须早于“截止日期次日 00:00”的 exclusive end；
 - external / Google Drive 项必须排除；
 - 相同 `libraryFileId` 不会重复入队删除。
+
+> **再次提醒：本地文件夹只承担目录组织作用，不构成删除保护边界。** 脚本不会删除文件夹本身，但会递归检查其内部文件，并对符合条件的文件执行 soft delete。
 
 删除使用当前网页内部的 soft-delete 路径，不执行永久删除，也不会主动清空 Recently deleted。
 
