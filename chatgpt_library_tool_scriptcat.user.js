@@ -37,6 +37,13 @@
     'uploaded_at', 'uploadedAt', 'upload_time', 'uploadTime',
     'file_processed_time', 'fileProcessedTime',
   ];
+  const RAW_TIME_KEYS = [
+    'record_creation_time', 'recordCreationTime', 'file_upload_time', 'fileUploadTime',
+    'created_at', 'createdAt', 'created_at_utc', 'createdAtUtc', 'created_time', 'createdTime',
+    'create_time', 'createTime', 'uploaded_at', 'uploadedAt', 'upload_time', 'uploadTime',
+    'updated_at', 'updatedAt', 'modified_at', 'modifiedAt', 'modification_time',
+    'last_modified_time', 'lastModifiedTime', 'file_processed_time', 'fileProcessedTime',
+  ];
   const SIZE_KEYS = ['size_bytes', 'sizeBytes', 'file_size_bytes', 'fileSizeBytes', 'size'];
   const SENSITIVE_HEADER_RE = /(?:authorization|cookie|set-cookie|csrf|xsrf|account[-_]?id|session|credential|api[-_]?key|access[-_]?token|refresh[-_]?token|jwt|sentinel)/i;
   const SENSITIVE_KEY_RE = /(?:^|[_-])(?:token|secret|authorization|cookie|csrf|xsrf|account[_-]?id|session|credential|api[_-]?key|access[_-]?key|password|jwt|sentinel)(?:$|[_-])/i;
@@ -273,6 +280,11 @@
         const name = findScalarByKeys(node, NAME_KEYS, 2);
         const createdAt = findScalarByKeys(node, CREATED_KEYS, 2);
         const sizeBytes = findScalarByKeys(node, SIZE_KEYS, 2);
+        const rawTimes = {};
+        for (const key of RAW_TIME_KEYS) {
+          if (Object.prototype.hasOwnProperty.call(node, key)) rawTimes[key] = node[key];
+        }
+        const createdAtSource = CREATED_KEYS.find((key) => Object.prototype.hasOwnProperty.call(rawTimes, key) && Number.isFinite(toTimestamp(rawTimes[key]))) || null;
 
         if (
           node.kind === 'file' && isValidLibraryFileId(libraryFileId) && isValidFileId(fileId)
@@ -283,6 +295,8 @@
             parentDirectoryId: typeof node.parent_directory_id === 'string' ? node.parent_directory_id : null,
             name: typeof name === 'string' ? name : fileId,
             createdAt: (typeof createdAt === 'string' || typeof createdAt === 'number') ? createdAt : null,
+            createdAtSource,
+            rawTimes,
             sizeBytes: Number.isFinite(Number(sizeBytes)) ? Number(sizeBytes) : 0,
             externalProvider: detectExternalProvider(node),
           });
@@ -596,6 +610,71 @@
     return NaN;
   }
 
+  function localDateParts(value) {
+    const date = new Date(toTimestamp(value));
+    return Number.isFinite(date.getTime()) ? { year: date.getFullYear(), month: date.getMonth() + 1, day: date.getDate(), hour: date.getHours(), minute: date.getMinutes() } : null;
+  }
+
+  function localTimeText(value) {
+    const date = new Date(toTimestamp(value));
+    return Number.isFinite(date.getTime()) ? date.toLocaleString() : '无法解析';
+  }
+
+  function matchUiTimeFields(uiText, rawTimes) {
+    const text = String(uiText || '').trim();
+    const now = new Date();
+    const matches = [];
+    let precision = 'low';
+    const time = /^(\d{1,2}):(\d{2})$/.exec(text);
+    const monthDay = /^(\d{1,2})月(\d{1,2})日$/.exec(text);
+    const fullDate = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/.exec(text);
+    if (time) precision = 'medium';
+    else if (monthDay) precision = 'low';
+    else if (fullDate) precision = 'high';
+    for (const [key, value] of Object.entries(rawTimes || {})) {
+      const parts = localDateParts(value);
+      if (!parts) continue;
+      const matched = time ? parts.hour === Number(time[1]) && parts.minute === Number(time[2])
+        : monthDay ? parts.year === now.getFullYear() && parts.month === Number(monthDay[1]) && parts.day === Number(monthDay[2])
+          : fullDate ? parts.year === Number(fullDate[1]) && parts.month === Number(fullDate[2]) && parts.day === Number(fullDate[3]) : false;
+      if (matched) matches.push(key);
+    }
+    return { uiLikelyMatches: matches, confidence: matches.length === 1 ? precision : 'low', ambiguous: matches.length > 1 };
+  }
+
+  function extractUiModifiedTimeFromRows(rows, record) {
+    const targetId = record?.libraryFileId;
+    const targetName = record?.name;
+    const row = (rows || []).find((candidate) => candidate && ((targetId && candidate.id === targetId) || (targetName && candidate.name === targetName)));
+    if (!row) return { uiModifiedTimeText: null, reason: 'not currently rendered' };
+    return { uiModifiedTimeText: row.modifiedText == null ? null : String(row.modifiedText), reason: row.modifiedText == null ? 'modified time cell unavailable' : null };
+  }
+
+  function sanitizeTimeDiagnostics(items) {
+    return (items || []).map((item) => ({
+      fileName: item.fileName || null, libraryFileId: item.libraryFileId || null, parentDirectoryId: item.parentDirectoryId || null,
+      createdAt: item.createdAt || null, createdAtSource: item.createdAtSource || null,
+      rawTimes: Object.fromEntries(Object.entries(item.rawTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
+      parsedLocalTimes: Object.fromEntries(Object.entries(item.parsedLocalTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
+      uiModifiedTimeText: item.uiModifiedTimeText ?? null, uiLikelyMatches: item.uiLikelyMatches || [], confidence: item.confidence || 'low',
+    }));
+  }
+
+  function summarizeTimeDiagnostics(items) {
+    const summary = { sampleCount: items.length, uiComparableCount: 0, likelyMatches: {}, ambiguous: 0, createdAtSources: {} };
+    for (const item of items) {
+      const source = item.createdAtSource || 'unknown';
+      summary.createdAtSources[source] = (summary.createdAtSources[source] || 0) + 1;
+      if (item.uiModifiedTimeText) summary.uiComparableCount += 1;
+      if (item.ambiguous) summary.ambiguous += 1;
+      else if (item.uiLikelyMatches?.length === 1) {
+        const key = item.uiLikelyMatches[0];
+        summary.likelyMatches[key] = (summary.likelyMatches[key] || 0) + 1;
+      }
+    }
+    return summary;
+  }
+
   function selectDeletionTargets(records, cutoffMs) {
     const targets = [];
     let unknownDateCount = 0;
@@ -758,6 +837,9 @@
     isValidFileId,
     isValidLibraryFileId,
     validateDeletionTarget,
+    matchUiTimeFields,
+    extractUiModifiedTimeFromRows,
+    sanitizeTimeDiagnostics,
     createDeleteQueue,
     runDeleteQueuePipeline,
     runVerificationPasses,
@@ -773,6 +855,7 @@
     inflight: 0,
     rawEvents: [],
     diagnostics: [],
+    timeFieldDiagnostics: [],
     serial: 0,
     scanning: false,
     deleting: false,
@@ -1679,8 +1762,41 @@
         current_cursor: state.scan.currentCursor,
         oldest_date: oldestDateText(),
       },
+      timeFieldDiagnostics: sanitizeTimeDiagnostics(state.timeFieldDiagnostics),
+      timeFieldDiagnosticsSummary: summarizeTimeDiagnostics(state.timeFieldDiagnostics),
       events: state.diagnostics,
     };
+  }
+
+  function diagnoseTimeFields() {
+    if (!state.scan.records.size) {
+      root.alert('当前没有扫描记录，请先执行“自动扫描全部”或扫描一部分。');
+      return;
+    }
+    const candidates = [...state.scan.records.values()]
+      .filter((record) => validateDeletionTarget(record).valid && !record.externalProvider)
+      .sort((a, b) => Number(Object.keys(b.rawTimes || {}).length > 1) - Number(Object.keys(a.rawTimes || {}).length > 1))
+      .slice(0, 10);
+    const rows = [...root.document.querySelectorAll('[role="row"]')].map((row) => {
+      const cells = [...row.querySelectorAll('[role="gridcell"]')];
+      return {
+        id: row.getAttribute('data-page-table-selection-id'),
+        name: cells[0]?.innerText?.trim() || '',
+        modifiedText: cells[1]?.innerText?.trim() || null,
+      };
+    });
+    state.timeFieldDiagnostics = candidates.map((record) => {
+      const ui = extractUiModifiedTimeFromRows(rows, record);
+      const match = ui.uiModifiedTimeText ? matchUiTimeFields(ui.uiModifiedTimeText, record.rawTimes) : { uiLikelyMatches: [], confidence: 'low', ambiguous: false };
+      return { fileName: record.name, libraryFileId: record.libraryFileId, parentDirectoryId: record.parentDirectoryId, createdAt: record.createdAt, createdAtSource: record.createdAtSource, rawTimes: record.rawTimes, parsedLocalTimes: Object.fromEntries(Object.entries(record.rawTimes || {}).map(([key, value]) => [key, localTimeText(value)])), uiModifiedTimeText: ui.uiModifiedTimeText, reason: ui.reason, ...match };
+    });
+    const pre = root.document.getElementById('cgpt-lib-tool-time-diagnostic');
+    if (pre) {
+      const summary = summarizeTimeDiagnostics(state.timeFieldDiagnostics);
+      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n当前删除日期来源：${JSON.stringify(summary.createdAtSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}\n\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.createdAtSource || '未知'} = ${item.createdAt || '未知'}\n匹配：${item.uiLikelyMatches.join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${Object.entries(item.rawTimes).map(([key, value]) => `${key}: ${value} → 本地 ${item.parsedLocalTimes[key]}`).join('; ')}`).join('\n\n');
+      pre.style.display = 'block';
+    }
+    updateUi();
   }
 
   async function copyText(text) {
@@ -1730,6 +1846,7 @@
     const scanBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="scan"]');
     const deleteBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="delete"]');
     const pipelineBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="pipeline"]');
+    const timeBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="time"]');
     const stopBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="stop"]');
 
     if (mainButton) {
@@ -1768,6 +1885,7 @@
     if (scanBtn) scanBtn.disabled = state.scanning || state.deleting;
     if (deleteBtn) deleteBtn.disabled = !canDeleteScannedRecords({ scanning: state.scanning, deleting: state.deleting, recordCount: state.scan.records.size });
     if (pipelineBtn) pipelineBtn.disabled = state.scanning || state.deleting;
+    if (timeBtn) timeBtn.disabled = state.scan.records.size === 0 || state.scanning || state.deleting;
     if (stopBtn) stopBtn.disabled = !state.scanning && !state.deleting;
   }
 
@@ -1818,6 +1936,7 @@
         <div style="grid-column:1 / 3;color:#fbbf24">删除接口：未进行真实单文件验证</div>
       </div>
       <div id="cgpt-lib-tool-status" style="padding:8px 9px;background:#1f2937;border-radius:8px;margin-bottom:10px">等待操作。</div>
+      <pre id="cgpt-lib-tool-time-diagnostic" style="display:none;max-height:260px;overflow:auto;white-space:pre-wrap;background:#0b1220;padding:8px;border-radius:8px;font-size:11px"></pre>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
         <label style="flex:1">删除截至日期（含当天）：<input id="cgpt-lib-tool-cutoff" type="date" value="${DEFAULT_CUTOFF}" style="width:145px;margin-left:5px"></label>
         <label>并发：<input id="cgpt-lib-tool-concurrency" type="number" min="1" max="${MAX_CONCURRENCY}" value="${DEFAULT_CONCURRENCY}" style="width:55px;margin-left:4px"></label>
@@ -1826,6 +1945,7 @@
         <button data-act="scan">自动扫描全部</button>
         <button data-act="pipeline">扫描并删除旧文件</button>
         <button data-act="delete" disabled>删除已扫描旧文件</button>
+        <button data-act="time" disabled>诊断时间字段</button>
         <button data-act="stop" disabled>停止</button>
         <button data-act="copy">复制诊断 JSON</button>
         <button data-act="download">下载诊断 JSON</button>
@@ -1853,6 +1973,7 @@
       if (action === 'scan') autoScanAll();
       else if (action === 'pipeline') startDelete();
       else if (action === 'delete') startDeleteScannedRecords();
+      else if (action === 'time') diagnoseTimeFields();
       else if (action === 'stop') stopCurrent();
       else if (action === 'copy') {
         try { await copyText(JSON.stringify(diagnosticBundle(), null, 2)); root.alert('诊断 JSON 已复制。'); }

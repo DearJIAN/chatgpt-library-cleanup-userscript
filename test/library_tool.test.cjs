@@ -310,3 +310,42 @@ test('a verified session starts workers without asking again', async () => {
   assert.deepEqual(seen, ['file_a', 'file_b']);
   assert.equal(result.confirmed, true);
 });
+
+test('preserves raw time fields and records the effective createdAt source', () => {
+  const [record] = tool.extractFileRecords({ items: [{
+    kind: 'file', id: 'libfile_times', file_id: 'file_times', name: 'times.txt',
+    record_creation_time: '2026-05-01T03:20:00Z', file_upload_time: '2026-05-01T03:21:12Z',
+    updated_at: '2026-08-20T07:10:00Z', modified_at: '2026-08-20T07:11:00Z',
+  }] });
+  assert.equal(record.createdAtSource, 'record_creation_time');
+  assert.equal(record.rawTimes.record_creation_time, '2026-05-01T03:20:00Z');
+  assert.equal(record.rawTimes.file_upload_time, '2026-05-01T03:21:12Z');
+  assert.equal(record.rawTimes.updated_at, '2026-08-20T07:10:00Z');
+  assert.equal(record.rawTimes.created_at, undefined);
+  assert.equal(record.createdAt, record.rawTimes.record_creation_time);
+});
+
+test('matches UI today time and month-day text without forcing a semantic conclusion', () => {
+  const now = new Date();
+  const todayTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  const todayIso = new Date(now.getTime() - (now.getSeconds() * 1000 + now.getMilliseconds())).toISOString();
+  const timeMatch = tool.matchUiTimeFields(todayTime, { record_creation_time: todayIso });
+  assert.deepEqual(timeMatch.uiLikelyMatches, ['record_creation_time']);
+  assert.equal(timeMatch.confidence, 'medium');
+
+  const monthDay = `${now.getMonth() + 1}月${now.getDate()}日`;
+  const dateMatch = tool.matchUiTimeFields(monthDay, { updated_at: todayIso, modified_at: todayIso });
+  assert.deepEqual(dateMatch.uiLikelyMatches.sort(), ['modified_at', 'updated_at']);
+  assert.equal(dateMatch.ambiguous, true);
+});
+
+test('UI row extraction returns null when the record is not currently rendered', () => {
+  assert.deepEqual(tool.extractUiModifiedTimeFromRows([{ id: 'other', name: 'other.txt', modifiedText: '8月1日' }], { libraryFileId: 'libfile_missing', name: 'missing.txt' }), { uiModifiedTimeText: null, reason: 'not currently rendered' });
+});
+
+test('time diagnostic export contains no sensitive fields', () => {
+  const safe = tool.sanitizeTimeDiagnostics([{ fileName: 'a.txt', rawTimes: { updated_at: 'x', Authorization: 'secret', email: 'x@y.test' }, uiModifiedTimeText: null }]);
+  assert.equal(JSON.stringify(safe).includes('secret'), false);
+  assert.equal(JSON.stringify(safe).includes('x@y.test'), false);
+  assert.equal(safe[0].rawTimes.updated_at, 'x');
+});

@@ -4,6 +4,14 @@
 
 项目早期没有建立独立 CHANGELOG，以下内容根据现有 Git 提交历史补录。
 
+## [0.8.4] - 2026-09-01
+
+### Added
+
+- 新增只读“诊断时间字段”功能；保留 nodes 响应中实际出现的原始时间字段和 `createdAtSource`；
+- 采集当前已渲染文件行的“修改时间”，并对后台字段执行本地时区下的弱匹配与 ambiguous 标记；
+- 诊断 JSON 增加 `timeFieldDiagnostics` 及摘要，继续脱敏；不改变删除规则、截止日期、扫描、删除或 verification 行为。
+
 ## [0.8.3] - 2026-09-01
 
 Commit: `2db0a90` — `Fix partial-scan deletion and inclusive cutoff`
