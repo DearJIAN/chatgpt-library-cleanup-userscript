@@ -2,8 +2,8 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.0
-// @description  自动捕获 ChatGPT Library 真实接口，自动触发/学习分页并全量扫描；扫描完整后可按日期高速并发软删除旧文件。含诊断 JSON 导出与随时停止。
+// @version      0.8.1
+// @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @grant        none
@@ -13,7 +13,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.0';
+  const SCRIPT_VERSION = '0.8.1';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -22,6 +22,7 @@
   const MAX_PAGES_PER_DIRECTORY = 500;
   const MAX_DIRECTORIES = 10_000;
   const MAX_TOTAL_REQUESTS = 20_000;
+  const MAX_VERIFY_PASSES = 3;
   const MAX_EVENTS = 500;
   const MAX_RESPONSE_TEXT = 8_000_000;
   const REDACTED = '[REDACTED]';
@@ -164,9 +165,28 @@
         onProgress?.({ deleted: succeeded, failed: failed.length, processed, total: null, probing: false });
       }
     }
-    const workers = Math.max(0, Math.min(MAX_CONCURRENCY, Number(concurrency) - 1));
+    const workers = Math.max(1, Math.min(MAX_CONCURRENCY, Number(concurrency)));
     await Promise.all(Array.from({ length: workers }, worker));
     return { probeSucceeded: true, deleted: succeeded, failed, processed, remaining: queue.length, stopped: Boolean(shouldStop?.()) };
+  }
+
+  async function runVerificationPasses({ scan, deleteTargets, deletedIds = new Set(), maxPasses = MAX_VERIFY_PASSES } = {}) {
+    if (typeof scan !== 'function' || typeof deleteTargets !== 'function') throw new Error('验证扫描参数无效。');
+    const seenDeleted = deletedIds instanceof Set ? deletedIds : new Set(deletedIds);
+    let lastRemaining = [];
+    for (let pass = 1; pass <= Math.min(MAX_VERIFY_PASSES, Math.max(1, maxPasses)); pass += 1) {
+      const result = await scan(pass);
+      if (!result?.complete) return { complete: false, passes: pass, remaining: lastRemaining, reason: 'verification scan incomplete' };
+      lastRemaining = (Array.isArray(result.targets) ? result.targets : [])
+        .filter((record) => validateDeletionTarget(record).valid && !seenDeleted.has(record.libraryFileId));
+      if (!lastRemaining.length) return { complete: true, passes: pass, remaining: [] };
+      const deletion = await deleteTargets(lastRemaining, pass);
+      for (const id of deletion?.deletedIds || []) seenDeleted.add(id);
+      if (deletion?.failed?.length) {
+        return { complete: false, passes: pass, remaining: lastRemaining, reason: 'verification delete incomplete' };
+      }
+    }
+    return { complete: false, passes: Math.min(MAX_VERIFY_PASSES, Math.max(1, maxPasses)), remaining: lastRemaining, reason: 'verification pass limit reached' };
   }
 
   function cloneJson(value) {
@@ -723,6 +743,7 @@
     validateDeletionTarget,
     createDeleteQueue,
     runDeleteQueuePipeline,
+    runVerificationPasses,
     traverseLibraryTree,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
@@ -1427,9 +1448,9 @@
       .finally(() => queue.close());
     try {
       const first = await queue.waitForItem();
-      const scanResult = first ? null : await scanPromise;
+      const firstWaitScanResult = first ? null : await scanPromise;
       if (!first) {
-        if (scanResult?.complete) root.alert(`扫描完整，但没有发现创建时间早于 ${dateText} 的可删除本地文件。`);
+        if (firstWaitScanResult) root.alert(`扫描完整，但没有发现创建时间早于 ${dateText} 的可删除本地文件。`);
         return;
       }
       const confirmed = root.confirm(
@@ -1440,7 +1461,12 @@
         `将先对 1 个文件执行 soft delete 探测；探测失败会阻止其余请求。\n` +
         `确定开始吗？`,
       );
-      if (!confirmed) { queue.stop(); return; }
+      if (!confirmed) {
+        state.stopRequested = true;
+        queue.stop();
+        await scanPromise.catch(() => undefined);
+        return;
+      }
       state.deleting = true;
       state.deleteStartedAt = Date.now();
       updateUi();
@@ -1449,10 +1475,40 @@
         deleteOne,
         onProgress: ({ deleted, failed }) => { state.deleteSucceeded = deleted; state.deleteFailed = failed; updateUi(); },
       });
-      const result = await Promise.all([scanPromise, deletePromise]).then((values) => values[1]);
+      const scanResult = await scanPromise;
+      const result = await deletePromise;
       if (result.failed.length) console.error('[ChatGPT Library 工具] 删除失败：', result.failed);
-      root.alert(`流式清理结束。\n\n成功：${result.deleted}\n失败：${result.failed.length}\n未处理：${result.remaining}`);
-      if (result.probeSucceeded && result.remaining === 0 && !state.scan.warning) state.scan.warning = '删除完成；请刷新页面后重新扫描确认列表状态。';
+      if (!scanResult || !result.probeSucceeded || result.failed.length || result.remaining) {
+        root.alert(`流式清理结束，但未通过安全验证。\n\n成功：${result.deleted}\n失败：${result.failed.length}\n未处理：${result.remaining}`);
+        return;
+      }
+      const deletedIds = new Set(queue.snapshot().deleted);
+      const verification = await runVerificationPasses({
+        scan: async () => {
+          if (state.stopRequested) return { complete: false, targets: [] };
+          const freshSeed = await fetchLibraryNodes(buildLibraryNodesUrl(null, null), seed);
+          state.scan.records = new Map();
+          const complete = await directLibraryTreeScan(freshSeed);
+          return { complete, targets: selectDeletionTargets([...state.scan.records.values()], cutoffMs).targets };
+        },
+        deleteTargets: async (targets) => {
+          const verificationQueue = createDeleteQueue({ cutoffMs });
+          verificationQueue.enqueue(targets);
+          verificationQueue.close();
+          state.deleteQueue = verificationQueue;
+          const verificationDelete = await runDeleteQueuePipeline({
+            queue: verificationQueue, concurrency, shouldStop: () => state.stopRequested,
+            deleteOne, onProgress: ({ deleted, failed }) => { state.deleteSucceeded = deleted; state.deleteFailed = failed; updateUi(); },
+          });
+          return { deletedIds: verificationQueue.snapshot().deleted, failed: verificationDelete.failed };
+        },
+        deletedIds,
+      });
+      if (verification.complete) {
+        root.alert('清理验证完成：未发现遗漏旧文件。');
+      } else {
+        root.alert(`清理验证未完成。\n\n剩余目标：${verification.remaining.length}\n已达到最多 ${MAX_VERIFY_PASSES} 轮或本轮扫描/删除不完整。`);
+      }
     } catch (error) {
       if (error?.message === 'STOP_REQUESTED') root.alert('扫描/删除已停止。');
       else { state.scan.warning = `流式扫描失败：${error?.message || error}`; root.alert(state.scan.warning); }
@@ -1559,6 +1615,7 @@
   function stopCurrent() {
     if (!state.scanning && !state.deleting) return;
     state.stopRequested = true;
+    state.deleteQueue?.stop();
     updateUi();
   }
 

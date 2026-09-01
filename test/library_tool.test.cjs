@@ -223,3 +223,47 @@ test('stop prevents new claims while an in-flight delete is allowed to finish', 
   assert.deepEqual(started, ['file_a']);
   assert.equal(result.remaining, 1);
 });
+
+test('concurrency=1 still processes every target after the probe', async () => {
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
+  const records = ['a', 'b', 'c'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', externalProvider: '' }));
+  queue.enqueue(records); queue.close();
+  const seen = [];
+  const result = await tool.runDeleteQueuePipeline({ queue, concurrency: 1, deleteOne: async (record) => seen.push(record.fileId) });
+  assert.deepEqual(seen, ['file_a', 'file_b', 'file_c']);
+  assert.equal(result.deleted, 3);
+});
+
+test('concurrency=10 starts ten post-probe workers', async () => {
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
+  const records = Array.from({ length: 11 }, (_, i) => ({ libraryFileId: `libfile_${i}`, fileId: `file_${i}`, createdAt: '2020-01-01Z', externalProvider: '' }));
+  queue.enqueue(records); queue.close();
+  let active = 0; let maxActive = 0;
+  const result = await tool.runDeleteQueuePipeline({
+    queue, concurrency: 10,
+    deleteOne: async () => { active += 1; maxActive = Math.max(maxActive, active); await new Promise((resolve) => setImmediate(resolve)); active -= 1; },
+  });
+  assert.equal(result.deleted, 11);
+  assert.equal(maxActive, 10);
+});
+
+test('verification passes restart from fresh scans, stop at zero, and cap at three', async () => {
+  let scans = 0; let deletes = 0;
+  const result = await tool.runVerificationPasses({
+    maxPasses: 3,
+    scan: async () => ({ complete: true, targets: scans++ < 2 ? [{ libraryFileId: `libfile_${scans}`, fileId: `file_${scans}`, createdAt: '2020-01-01Z', externalProvider: '' }] : [] }),
+    deleteTargets: async (targets) => { deletes += targets.length; return { deletedIds: targets.map((x) => x.libraryFileId) }; },
+  });
+  assert.equal(result.complete, true);
+  assert.equal(scans, 3);
+  assert.equal(deletes, 2);
+
+  let cappedScans = 0;
+  const capped = await tool.runVerificationPasses({
+    maxPasses: 3,
+    scan: async () => ({ complete: true, targets: [{ libraryFileId: `libfile_repeat_${++cappedScans}`, fileId: 'file_repeat', createdAt: '2020-01-01Z', externalProvider: '' }] }),
+    deleteTargets: async () => ({ deletedIds: [] }),
+  });
+  assert.equal(capped.complete, false);
+  assert.equal(cappedScans, 3);
+});
