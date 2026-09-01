@@ -366,6 +366,34 @@ test('time diagnostic samples prioritize differing update and creation times', (
   assert.equal(tool.selectTimeDiagnosticSamples(records, 1)[0].libraryFileId, 'libfile_diff');
 });
 
+test('time diagnostic ranking prefers cross-minute and cross-date evidence over same-minute differences', () => {
+  const make = (id, creation, updated) => ({
+    libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: creation,
+    rawTimeEntries: [
+      { key: 'record_creation_time', path: 'record_creation_time', value: creation },
+      { key: 'updated_at', path: 'updated_at', value: updated },
+    ],
+  });
+  const samples = tool.selectTimeDiagnosticSamples([
+    make('same-minute', '2026-08-30T10:01:10Z', '2026-08-30T10:01:50Z'),
+    make('cross-minute', '2026-08-30T10:01:10Z', '2026-08-30T10:05:00Z'),
+    make('cross-date', '2026-08-30T23:59:00Z', '2026-08-31T00:01:00Z'),
+  ], 3);
+  assert.deepEqual(samples.map((item) => item.libraryFileId), ['libfile_cross-date', 'libfile_cross-minute', 'libfile_same-minute']);
+  assert.ok(samples[0].informationScore > samples[1].informationScore);
+  assert.ok(samples[0].distinguishingFields.includes('record_creation_time → updated_at'));
+});
+
+test('time diagnostic sample ranking tolerates missing and invalid timestamps', () => {
+  assert.doesNotThrow(() => tool.selectTimeDiagnosticSamples([
+    { libraryFileId: 'libfile_missing', fileId: 'file_missing', createdAt: '2026-08-01Z', rawTimeEntries: [] },
+    { libraryFileId: 'libfile_invalid', fileId: 'file_invalid', createdAt: '2026-08-01Z', rawTimeEntries: [
+      { key: 'record_creation_time', path: 'record_creation_time', value: 'not-a-date' },
+      { key: 'updated_at', path: 'updated_at', value: 'also-not-a-date' },
+    ] },
+  ]));
+});
+
 test('time diagnostic export contains no sensitive fields', () => {
   const safe = tool.sanitizeTimeDiagnostics([{ fileName: 'a.txt', rawTimes: { updated_at: 'x', Authorization: 'secret', email: 'x@y.test' }, uiModifiedTimeText: null }]);
   assert.equal(JSON.stringify(safe).includes('secret'), false);
@@ -408,12 +436,12 @@ test('UI matches include full paths and ambiguous entries', () => {
   ]);
 });
 
-test('userscript metadata is 0.8.5 and points update/download to the public raw file', () => {
+test('userscript metadata is 0.8.6 and points update/download to the public raw file', () => {
   const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
   const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
   const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
   const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
-  assert.equal(version, '0.8.5');
+  assert.equal(version, '0.8.6');
   assert.equal(scriptVersion, version);
   assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
@@ -443,4 +471,20 @@ test('profile name is redacted in /backend-api/me-shaped payloads', () => {
   assert.equal(result.id, '[REDACTED]');
   assert.equal(result.name, '[REDACTED]');
   assert.equal(result.email, '[REDACTED]');
+});
+
+test('opaque diagnostic headers are redacted recursively', () => {
+  const result = tool.sanitizeJson({ headers: [
+    { 'oai-device-id': 'device-secret', 'x-oai-is-client-observation': 'opaque-1' },
+    { 'x-oai-is-update': 'opaque-2', 'x-oai-request-id': 'request-secret' },
+  ] });
+  assert.deepEqual(result.headers, [
+    { 'oai-device-id': '[REDACTED]', 'x-oai-is-client-observation': '[REDACTED]' },
+    { 'x-oai-is-update': '[REDACTED]', 'x-oai-request-id': '[REDACTED]' },
+  ]);
+});
+
+test('header sanitizer redacts opaque headers without changing request behavior', () => {
+  const result = tool.sanitizeHeaders({ 'oai-device-id': 'd', 'x-oai-is-update': 'u', 'x-oai-request-id': 'r', 'content-type': 'application/json' });
+  assert.deepEqual(result, { 'oai-device-id': '[REDACTED]', 'x-oai-is-update': '[REDACTED]', 'x-oai-request-id': '[REDACTED]', 'content-type': 'application/json' });
 });

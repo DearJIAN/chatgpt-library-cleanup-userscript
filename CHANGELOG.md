@@ -4,6 +4,13 @@
 
 项目早期没有建立独立 CHANGELOG，以下内容根据现有 Git 提交历史补录。
 
+## [0.8.6] - 2026-09-02
+
+### Fixed
+
+- 改进高信息量时间字段诊断样本排序，优先选择跨日期、跨分钟或存在明显时间差异的文件；未渲染样本继续 fail-safe 标记，不伪造 UI 匹配。
+- 强化诊断 JSON 递归脱敏，覆盖新的 OAI device、observation、update 和 request opaque headers。
+
 ## [0.8.5] - 2026-09-02
 
 ### Fixed
