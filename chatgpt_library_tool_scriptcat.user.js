@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.1
+// @version      0.8.2
 // @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -13,7 +13,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.1';
+  const SCRIPT_VERSION = '0.8.2';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -130,7 +130,7 @@
     };
   }
 
-  async function runDeleteQueuePipeline({ queue, concurrency = DEFAULT_CONCURRENCY, deleteOne, shouldStop, onProgress } = {}) {
+  async function runDeleteQueuePipeline({ queue, concurrency = DEFAULT_CONCURRENCY, deleteOne, shouldStop, onProgress, confirmAfterProbe } = {}) {
     if (!queue || typeof queue.next !== 'function' || typeof deleteOne !== 'function') throw new Error('删除队列参数无效。');
     const failed = [];
     let succeeded = 0;
@@ -148,6 +148,14 @@
       failed.push({ record: first, error: String(error?.message || error) });
       queue.stop();
       return { probeSucceeded: false, deleted: 0, failed, processed, remaining: queue.length };
+    }
+    if (typeof confirmAfterProbe === 'function') {
+      let confirmed = false;
+      try { confirmed = await confirmAfterProbe(first); } catch (_) { confirmed = false; }
+      if (!confirmed) {
+        queue.stop();
+        return { probeSucceeded: true, confirmed: false, deleted: succeeded, failed, processed, remaining: queue.length };
+      }
     }
     async function worker() {
       while (!shouldStop?.()) {
@@ -167,7 +175,7 @@
     }
     const workers = Math.max(1, Math.min(MAX_CONCURRENCY, Number(concurrency)));
     await Promise.all(Array.from({ length: workers }, worker));
-    return { probeSucceeded: true, deleted: succeeded, failed, processed, remaining: queue.length, stopped: Boolean(shouldStop?.()) };
+    return { probeSucceeded: true, confirmed: true, deleted: succeeded, failed, processed, remaining: queue.length, stopped: Boolean(shouldStop?.()) };
   }
 
   async function runVerificationPasses({ scan, deleteTargets, deletedIds = new Set(), maxPasses = MAX_VERIFY_PASSES } = {}) {
@@ -760,6 +768,7 @@
     scanning: false,
     deleting: false,
     stopRequested: false,
+    deleteSchemaVerifiedForSession: false,
     scan: {
       records: new Map(),
       complete: false,
@@ -1453,26 +1462,26 @@
         if (firstWaitScanResult) root.alert(`扫描完整，但没有发现创建时间早于 ${dateText} 的可删除本地文件。`);
         return;
       }
-      const confirmed = root.confirm(
-        `ChatGPT Library 流式清理\n\n` +
-        `扫描仍在继续，目前已发现将删除：${queue.length} 个文件\n` +
-        `日期规则：创建时间 < ${dateText} 本地 00:00\n` +
-        `并发：${concurrency}\n\n` +
-        `将先对 1 个文件执行 soft delete 探测；探测失败会阻止其余请求。\n` +
-        `确定开始吗？`,
-      );
-      if (!confirmed) {
-        state.stopRequested = true;
-        queue.stop();
-        await scanPromise.catch(() => undefined);
-        return;
-      }
       state.deleting = true;
       state.deleteStartedAt = Date.now();
       updateUi();
       const deletePromise = runDeleteQueuePipeline({
         queue, concurrency, shouldStop: () => state.stopRequested,
         deleteOne,
+        confirmAfterProbe: state.deleteSchemaVerifiedForSession ? undefined : async (record) => {
+          const confirmed = root.confirm(
+            `首个 soft-delete 请求已成功返回。\n\n` +
+            `测试文件：\n文件名：${record.name || '[未知]'}\nLibrary ID：${record.libraryFileId}\n\n` +
+            `请确认该文件已经从 ChatGPT Library 主列表中消失。\n\n` +
+            `是否继续批量删除？`,
+          );
+          if (confirmed) {
+            state.deleteSchemaVerifiedForSession = true;
+            return true;
+          }
+          state.stopRequested = true;
+          return false;
+        },
         onProgress: ({ deleted, failed }) => { state.deleteSucceeded = deleted; state.deleteFailed = failed; updateUi(); },
       });
       const scanResult = await scanPromise;

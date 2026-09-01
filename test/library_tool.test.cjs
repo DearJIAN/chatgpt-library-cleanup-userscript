@@ -267,3 +267,30 @@ test('verification passes restart from fresh scans, stop at zero, and cap at thr
   assert.equal(capped.complete, false);
   assert.equal(cappedScans, 3);
 });
+
+test('pauses after the first successful probe until the user confirms', async () => {
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
+  queue.enqueue(['a', 'b', 'c'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', externalProvider: '' })));
+  queue.close();
+  const seen = [];
+  const result = await tool.runDeleteQueuePipeline({
+    queue, concurrency: 10,
+    deleteOne: async (record) => seen.push(record.fileId),
+    confirmAfterProbe: async (record) => { assert.equal(record.fileId, 'file_a'); return false; },
+  });
+  assert.deepEqual(seen, ['file_a']);
+  assert.equal(result.confirmed, false);
+  assert.equal(result.remaining, 2);
+});
+
+test('a verified session starts workers without asking again', async () => {
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
+  queue.enqueue(['a', 'b'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', externalProvider: '' })));
+  queue.close();
+  const seen = [];
+  const result = await tool.runDeleteQueuePipeline({
+    queue, concurrency: 1, deleteOne: async (record) => seen.push(record.fileId),
+  });
+  assert.deepEqual(seen, ['file_a', 'file_b']);
+  assert.equal(result.confirmed, true);
+});
