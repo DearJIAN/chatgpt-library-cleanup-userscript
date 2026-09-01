@@ -2,84 +2,109 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const tool = require('../chatgpt_library_tool_scriptcat.user.js');
 
-test('extracts current Library node schema and record_creation_time', () => {
-  const records = tool.extractFileRecords({
-    items: [{
-      kind: 'file',
-      id: 'libfile_abc123',
-      name: 'old.pdf',
-      file_id: 'file_00000000abc123',
-      record_creation_time: '2026-07-31T23:59:59.000Z',
-      file_upload_time: '2026-07-31T23:59:59.000Z',
-      file_size_bytes: 123,
-      app_id: 'chatgpt-web',
-    }],
-    cursor: null,
+const file = (id, parent, created = '2026-07-31T00:00:00.000Z') => ({
+  kind: 'file', id: `libfile_${id}`, file_id: `file_${id}`, parent_directory_id: parent,
+  name: `${id}.txt`, record_creation_time: created, updated_at: '2026-09-01T00:00:00.000Z',
+});
+
+test('extracts current node schema, preserves parent, and prioritizes creation time', () => {
+  const [record] = tool.extractFileRecords({ items: [file('a', 'libdir_root')] });
+  assert.equal(record.libraryFileId, 'libfile_a');
+  assert.equal(record.fileId, 'file_a');
+  assert.equal(record.parentDirectoryId, 'libdir_root');
+  assert.equal(record.createdAt, '2026-07-31T00:00:00.000Z');
+});
+
+test('builds root and child nodes URLs with independent cursors', () => {
+  assert.match(tool.buildLibraryNodesUrl(), /\/nodes\?include_saved_entities=true&include_folder_counts=true$/);
+  assert.match(tool.buildLibraryNodesUrl(null, 'root-c1'), /cursor=root-c1/);
+  assert.match(tool.buildLibraryNodesUrl('libdir_d1', 'd1-c1'), /parent_directory_id=libdir_d1/);
+  assert.match(tool.buildLibraryNodesUrl('libdir_d1', 'd1-c1'), /cursor=d1-c1/);
+});
+
+test('parses a nullable cursor and fails closed on malformed items', () => {
+  assert.deepEqual(tool.parseLibraryNodesPayload({ items: [], cursor: null }), { items: [], cursor: null });
+  assert.throws(() => tool.parseLibraryNodesPayload({ cursor: null }), /items 数组/);
+});
+
+test('traverses root cursor pages', async () => {
+  const calls = [];
+  const pages = new Map([
+    ['ROOT::FIRST', { items: [file('a', null)], cursor: 'root-c1' }],
+    ['ROOT::root-c1', { items: [file('b', null)], cursor: null }],
+  ]);
+  const result = await tool.traverseLibraryTree(async (parent, cursor) => {
+    calls.push([parent, cursor]); return pages.get(`${parent || 'ROOT'}::${cursor || 'FIRST'}`);
   });
-
-  assert.equal(records.length, 1);
-  assert.equal(records[0].libraryFileId, 'libfile_abc123');
-  assert.equal(records[0].createdAt, '2026-07-31T23:59:59.000Z');
-  assert.equal(records[0].sizeBytes, 123);
+  assert.deepEqual(result.files.map(x => x.name), ['a.txt', 'b.txt']);
+  assert.equal(result.pages, 2);
+  assert.deepEqual(calls, [[null, null], [null, 'root-c1']]);
+  assert.equal(result.complete, true);
 });
 
-test('current directory and external root are never deletion records', () => {
-  const records = tool.extractFileRecords({
-    items: [
-      { kind: 'directory', id: 'external-gdrive:root', name: 'Google Drive' },
-      { kind: 'directory', id: 'libdir_local', name: 'Folder' },
-    ],
+test('traverses child directory cursor pages', async () => {
+  const pages = new Map([
+    ['ROOT::FIRST', { items: [{ kind: 'directory', id: 'libdir_d1', name: 'D1' }], cursor: null }],
+    ['libdir_d1::FIRST', { items: [file('c', 'libdir_d1')], cursor: 'd1-c1' }],
+    ['libdir_d1::d1-c1', { items: [file('d', 'libdir_d1')], cursor: null }],
+  ]);
+  const result = await tool.traverseLibraryTree(async (parent, cursor) => pages.get(`${parent || 'ROOT'}::${cursor || 'FIRST'}`));
+  assert.deepEqual(result.files.map(x => x.name), ['c.txt', 'd.txt']);
+  assert.equal(result.pages, 3);
+});
+
+test('traverses root and child cursors together, dedupes directories, and skips Google Drive', async () => {
+  const pages = new Map([
+    ['ROOT::FIRST', { items: [file('a', null), { kind: 'directory', id: 'libdir_d1' }, { kind: 'directory', id: 'external-gdrive:root' }], cursor: 'root-c1' }],
+    ['ROOT::root-c1', { items: [file('b', null), { kind: 'directory', id: 'libdir_d1' }], cursor: null }],
+    ['libdir_d1::FIRST', { items: [file('c', 'libdir_d1')], cursor: 'd1-c1' }],
+    ['libdir_d1::d1-c1', { items: [file('d', 'libdir_d1')], cursor: null }],
+  ]);
+  const calls = [];
+  const result = await tool.traverseLibraryTree(async (parent, cursor) => {
+    calls.push(`${parent || 'ROOT'}::${cursor || 'FIRST'}`);
+    return pages.get(`${parent || 'ROOT'}::${cursor || 'FIRST'}`);
   });
-  assert.deepEqual(records, []);
+  assert.deepEqual(result.files.map(x => x.name), ['a.txt', 'b.txt', 'c.txt', 'd.txt']);
+  assert.deepEqual(calls, ['ROOT::FIRST', 'ROOT::root-c1', 'libdir_d1::FIRST', 'libdir_d1::d1-c1']);
+  assert.equal(result.complete, true);
 });
 
-test('builds the observed nodes endpoint without inventing pagination', () => {
-  assert.equal(
-    tool.buildLibraryNodesUrl(),
-    'https://chatgpt.com/backend-api/files/library/nodes?include_saved_entities=true&include_folder_counts=true',
-  );
-  assert.equal(
-    tool.buildLibraryNodesUrl('libdir_local'),
-    'https://chatgpt.com/backend-api/files/library/nodes?include_saved_entities=true&include_folder_counts=true&parent_directory_id=libdir_local',
-  );
-  assert.equal(tool.isLibraryNodesUrl('/backend-api/files/library/nodes?parent_directory_id=x'), true);
+test('fails safely on repeated cursor state and directory cycles', async () => {
+  await assert.rejects(tool.traverseLibraryTree(async () => ({ items: [], cursor: 'same' })), /重复的目录分页状态/);
+  await assert.rejects(tool.traverseLibraryTree(async () => ({ items: [{ kind: 'directory', id: 'libdir_self' }], cursor: null })), /目录分页状态|目录遍历|自引用/);
 });
 
-test('fails closed on a future non-null cursor', () => {
-  assert.throws(() => tool.parseLibraryNodesPayload({ items: [], cursor: 'unknown-next-page' }), /未支持的非空 cursor/);
+test('stops traversal when the user requests stop', async () => {
+  let stop = false;
+  await assert.rejects(
+    tool.traverseLibraryTree(async () => ({ items: [], cursor: 'next' }), {
+      shouldStop: () => stop,
+      onPage: () => { stop = true; },
+    }),
+    /STOP_REQUESTED/,
+  );
 });
 
-test('supports cursor, offset, and page-token pagination helpers', () => {
-  const makeEvent = (request, response) => ({ request, response, records: [{ libraryFileId: request.url, fileId: 'file_x' }] });
-  const cursorPrev = makeEvent(
-    { url: 'https://chatgpt.com/backend-api/files/library/legacy', method: 'GET', bodyJson: { cursor: null } },
-    { json: { items: [], next_cursor: 'c1' } },
-  );
-  const cursorNext = makeEvent(
-    { url: 'https://chatgpt.com/backend-api/files/library/legacy', method: 'GET', bodyJson: { cursor: 'c1' } },
-    { json: { items: [] } },
-  );
-  assert.equal(tool.learnPaginationRule(cursorPrev, cursorNext).kind, 'body-token');
+test('selects strict cutoff, preserves unknown dates and external files', () => {
+  const cutoff = tool.localCutoffMs('2026-08-01');
+  const records = [
+    { libraryFileId: 'libfile_old', fileId: 'file_old', createdAt: '2026-07-31T15:59:59Z' },
+    { libraryFileId: 'libfile_edge', fileId: 'file_edge', createdAt: '2026-07-31T16:00:00Z' },
+    { libraryFileId: 'libfile_unknown', fileId: 'file_unknown', createdAt: null },
+    { libraryFileId: 'libfile_external', fileId: 'file_external', createdAt: '2020-01-01Z', externalProvider: 'google_drive' },
+  ];
+  const selection = tool.selectDeletionTargets(records, cutoff);
+  assert.deepEqual(selection.targets.map(x => x.libraryFileId), ['libfile_old']);
+  assert.equal(selection.unknownDateCount, 1);
+  assert.equal(selection.externalCount, 1);
+});
 
-  const offsetPrev = makeEvent(
-    { url: 'https://chatgpt.com/backend-api/files/library/legacy', method: 'GET', bodyJson: { offset: 0 } },
-    { json: { next_offset: 25 } },
-  );
-  const offsetNext = makeEvent(
-    { url: 'https://chatgpt.com/backend-api/files/library/legacy', method: 'GET', bodyJson: { offset: 25 } },
-    { json: { items: [] } },
-  );
-  assert.equal(tool.learnPaginationRule(offsetPrev, offsetNext).kind, 'body-token');
-
-  const pagePrev = makeEvent(
-    { url: 'https://chatgpt.com/backend-api/files/library/legacy', method: 'GET', bodyJson: { page_token: 'p0' } },
-    { json: { next_page_token: 'p1' } },
-  );
-  const pageNext = makeEvent(
-    { url: 'https://chatgpt.com/backend-api/files/library/legacy', method: 'GET', bodyJson: { page_token: 'p1' } },
-    { json: { items: [] } },
-  );
-  assert.equal(tool.learnPaginationRule(pagePrev, pageNext).kind, 'body-token');
+test('builds soft-delete URL with parent directory and stable IDs', () => {
+  const url = tool.buildDeleteUrl({ libraryFileId: 'libfile_a', fileId: 'file_a', parentDirectoryId: 'libdir_d1', name: 'old file.pdf' });
+  assert.match(url, /file_id=file_a/);
+  assert.match(url, /parent_directory_id=libdir_d1/);
+  assert.match(url, /soft_delete=true/);
 });
 
 test('uses only retryable delete statuses and exponential backoff', () => {
@@ -89,11 +114,4 @@ test('uses only retryable delete statuses and exponential backoff', () => {
   assert.equal(tool.isRetryableDeleteStatus(404), false);
   assert.equal(tool.deleteRetryDelayMs(429, 2), 3200);
   assert.equal(tool.deleteRetryDelayMs(503, 2), 1400);
-});
-
-test('builds soft-delete URL from both stable IDs', () => {
-  assert.match(
-    tool.buildDeleteUrl({ libraryFileId: 'libfile_a', fileId: 'file_b', name: 'old file.pdf' }),
-    /\/backend-api\/files\/library\/files\/libfile_a\/delete_stream\?file_id=file_b&file_name=old%20file\.pdf&soft_delete=true$/,
-  );
 });

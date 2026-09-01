@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.5.0
+// @version      0.7.0
 // @description  自动捕获 ChatGPT Library 真实接口，自动触发/学习分页并全量扫描；扫描完整后可按日期高速并发软删除旧文件。含诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -13,7 +13,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.6.0';
+  const SCRIPT_VERSION = '0.7.0';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -27,11 +27,10 @@
   const FILE_ID_KEYS = ['file_id', 'fileId', 'backing_file_id', 'backingFileId'];
   const NAME_KEYS = ['file_name', 'fileName', 'name', 'filename', 'title'];
   const CREATED_KEYS = [
+    'record_creation_time', 'recordCreationTime', 'file_upload_time', 'fileUploadTime',
     'created_at', 'createdAt', 'created_at_utc', 'createdAtUtc',
     'created_time', 'createdTime', 'create_time', 'createTime',
     'uploaded_at', 'uploadedAt', 'upload_time', 'uploadTime',
-    'record_creation_time', 'recordCreationTime', 'file_upload_time', 'fileUploadTime',
-    'updated_at', 'updatedAt',
   ];
   const SIZE_KEYS = ['size_bytes', 'sizeBytes', 'file_size_bytes', 'fileSizeBytes', 'size'];
   const SENSITIVE_HEADER_RE = /(?:authorization|cookie|set-cookie|csrf|xsrf|account[-_]?id|session|credential|api[-_]?key|access[-_]?token|refresh[-_]?token|jwt|sentinel)/i;
@@ -139,6 +138,7 @@
           output.set(libraryFileId, {
             libraryFileId,
             fileId,
+            parentDirectoryId: typeof node.parent_directory_id === 'string' ? node.parent_directory_id : null,
             name: typeof name === 'string' ? name : fileId,
             createdAt: (typeof createdAt === 'string' || typeof createdAt === 'number') ? createdAt : null,
             sizeBytes: Number.isFinite(Number(sizeBytes)) ? Number(sizeBytes) : 0,
@@ -472,12 +472,15 @@
   }
 
   function buildDeleteUrl(record) {
-    return (
+    const url = (
       `/backend-api/files/library/files/${encodeURIComponent(record.libraryFileId)}/delete_stream` +
       `?file_id=${encodeURIComponent(record.fileId)}` +
       `&file_name=${encodeURIComponent(record.name || record.fileId)}` +
       '&soft_delete=true'
     );
+    return record.parentDirectoryId
+      ? `${url}&parent_directory_id=${encodeURIComponent(record.parentDirectoryId)}`
+      : url;
   }
 
   function isLibraryNodesUrl(value) {
@@ -485,18 +488,54 @@
     return Boolean(url && url.origin === 'https://chatgpt.com' && url.pathname === '/backend-api/files/library/nodes');
   }
 
-  function buildLibraryNodesUrl(parentDirectoryId = null) {
+  function buildLibraryNodesUrl(parentDirectoryId = null, cursor = null) {
     const url = new URL('/backend-api/files/library/nodes', 'https://chatgpt.com/');
     url.searchParams.set('include_saved_entities', 'true');
     url.searchParams.set('include_folder_counts', 'true');
     if (parentDirectoryId) url.searchParams.set('parent_directory_id', parentDirectoryId);
+    if (cursor) url.searchParams.set('cursor', cursor);
     return url.toString();
   }
 
   function parseLibraryNodesPayload(payload) {
     if (!isObject(payload) || !Array.isArray(payload.items)) throw new Error('Library nodes 响应缺少 items 数组。');
-    if (payload.cursor !== null && payload.cursor !== undefined) throw new Error('Library nodes 返回了未支持的非空 cursor，已安全停止。');
-    return payload.items;
+    if (payload.cursor !== null && payload.cursor !== undefined && typeof payload.cursor !== 'string') throw new Error('Library nodes cursor 类型未知，已安全停止。');
+    return { items: payload.items, cursor: payload.cursor || null };
+  }
+
+  async function traverseLibraryTree(fetchPage, options = {}) {
+    if (typeof fetchPage !== 'function') throw new Error('缺少 Library nodes 页面请求函数。');
+    const files = new Map();
+    const directoryQueue = [{ parentDirectoryId: null, cursor: null }];
+    const visitedStates = new Set();
+    const queuedDirectories = new Set();
+    let pages = 0;
+
+    while (directoryQueue.length) {
+      if (options.shouldStop?.()) throw new Error('STOP_REQUESTED');
+      const state = directoryQueue.shift();
+      const stateKey = `${state.parentDirectoryId || 'ROOT'}::${state.cursor || 'FIRST'}`;
+      if (visitedStates.has(stateKey)) throw new Error(`重复的目录分页状态：${stateKey}`);
+      visitedStates.add(stateKey);
+
+      const parsed = parseLibraryNodesPayload(await fetchPage(state.parentDirectoryId, state.cursor));
+      pages += 1;
+      for (const item of parsed.items) {
+        if (item?.kind === 'file') {
+          for (const record of extractFileRecords(item)) files.set(record.libraryFileId, record);
+        } else if (item?.kind === 'directory' && typeof item.id === 'string') {
+          if (item.id.startsWith('external-gdrive:') || item.name === 'Google Drive') continue;
+          if (item.id === state.parentDirectoryId) throw new Error(`检测到目录自引用：${item.id}`);
+          if (!queuedDirectories.has(item.id)) {
+            queuedDirectories.add(item.id);
+            directoryQueue.push({ parentDirectoryId: item.id, cursor: null });
+          }
+        }
+      }
+      options.onPage?.({ parentDirectoryId: state.parentDirectoryId, cursor: state.cursor, nextCursor: parsed.cursor, pages, files: files.size, pending: directoryQueue.length });
+      if (parsed.cursor !== null) directoryQueue.unshift({ parentDirectoryId: state.parentDirectoryId, cursor: parsed.cursor });
+    }
+    return { files: [...files.values()], pages, complete: true };
   }
 
   function chooseScanSeed(events) {
@@ -547,6 +586,7 @@
     parseLibraryNodesPayload,
     isRetryableDeleteStatus,
     deleteRetryDelayMs,
+    traverseLibraryTree,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
 
@@ -912,30 +952,20 @@
   }
 
   async function directLibraryTreeScan(seed) {
-    state.scan.mode = '后台直读目录树';
-    const queue = [];
-    const queued = new Set();
-    const addDirectory = (item) => {
-      if (!item || item.kind !== 'directory' || typeof item.id !== 'string') return;
-      if (item.id.startsWith('external-gdrive:') || item.name === 'Google Drive') return;
-      if (!queued.has(item.id)) { queued.add(item.id); queue.push(item.id); }
-    };
-    const addItems = (payload) => {
-      for (const item of parseLibraryNodesPayload(payload)) addDirectory(item);
-    };
-
-    addItems(seed.response.json);
-    let current = seed;
-    let index = 0;
-    while (index < queue.length) {
-      if (state.stopRequested) throw new Error('STOP_REQUESTED');
-      const directoryId = queue[index++];
-      current = await fetchLibraryNodes(buildLibraryNodesUrl(directoryId), seed);
-      addItems(current.response.json);
-      state.scan.pageCount += 1;
-      updateUi();
-    }
-    return true;
+    state.scan.mode = '后台直读目录树 + cursor 分页';
+    const result = await traverseLibraryTree(
+      async (parentDirectoryId, cursor) => {
+        if (parentDirectoryId === null && cursor === null) return seed.response.json;
+        const event = await fetchLibraryNodes(buildLibraryNodesUrl(parentDirectoryId, cursor), seed);
+        return event.response.json;
+      },
+      {
+        shouldStop: () => state.stopRequested,
+        onPage: ({ pages }) => { state.scan.pageCount = pages; updateUi(); },
+      },
+    );
+    for (const record of result.files) state.scan.records.set(record.libraryFileId, record);
+    return result.complete;
   }
 
   function scrollableCandidates() {
@@ -1399,13 +1429,14 @@
     panel.innerHTML = `
       <div style="font-size:16px;font-weight:800;margin-bottom:8px">ChatGPT Library 自动诊断 + 高速清理</div>
       <div style="padding:9px 10px;background:#0f3d35;border-radius:9px;margin-bottom:10px">
-        先完整扫描，后删除。扫描会自动滚动触发分页；学到 cursor/offset 后切到后台直读，不要求把所有文件渲染出来。
+        先完整扫描，后删除。正常路径按“目录树 × 每目录 cursor”后台直读，不要求把所有文件渲染到页面。
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px">
         <div>捕获请求：<b id="cgpt-lib-tool-captured">0</b></div>
         <div>扫描文件：<b id="cgpt-lib-tool-scanned">0</b></div>
         <div style="grid-column:1 / 3">最早日期：<b id="cgpt-lib-tool-oldest">未知</b></div>
         <div style="grid-column:1 / 3">扫描模式：<b id="cgpt-lib-tool-mode">idle</b></div>
+        <div style="grid-column:1 / 3;color:#fbbf24">删除接口：未进行真实单文件验证</div>
       </div>
       <div id="cgpt-lib-tool-status" style="padding:8px 9px;background:#1f2937;border-radius:8px;margin-bottom:10px">等待操作。</div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
