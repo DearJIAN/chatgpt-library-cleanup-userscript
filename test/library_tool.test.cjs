@@ -15,11 +15,21 @@ test('extracts current node schema, preserves parent, and prioritizes creation t
   assert.equal(record.createdAt, '2026-07-31T00:00:00.000Z');
 });
 
+test('falls back to file_upload_time when record_creation_time is absent', () => {
+  const [record] = tool.extractFileRecords({ items: [{
+    kind: 'file', id: 'libfile_upload', file_id: 'file_upload',
+    file_upload_time: '2026-07-30T00:00:00Z', updated_at: '2026-09-01T00:00:00Z',
+  }] });
+  assert.equal(record.createdAt, '2026-07-30T00:00:00Z');
+});
+
 test('builds root and child nodes URLs with independent cursors', () => {
   assert.match(tool.buildLibraryNodesUrl(), /\/nodes\?include_saved_entities=true&include_folder_counts=true$/);
   assert.match(tool.buildLibraryNodesUrl(null, 'root-c1'), /cursor=root-c1/);
   assert.match(tool.buildLibraryNodesUrl('libdir_d1', 'd1-c1'), /parent_directory_id=libdir_d1/);
   assert.match(tool.buildLibraryNodesUrl('libdir_d1', 'd1-c1'), /cursor=d1-c1/);
+  assert.match(tool.buildLibraryNodesUrl({ parentDirectoryId: 'libdir_d1', cursor: 'd1-c1' }), /parent_directory_id=libdir_d1/);
+  assert.match(tool.buildLibraryNodesUrl({ parentDirectoryId: 'libdir_d1', cursor: 'd1-c1' }), /cursor=d1-c1/);
 });
 
 test('parses a nullable cursor and fails closed on malformed items', () => {
@@ -83,6 +93,22 @@ test('stops traversal when the user requests stop', async () => {
       onPage: () => { stop = true; },
     }),
     /STOP_REQUESTED/,
+  );
+});
+
+test('fails closed when directory or total request safety limits are exceeded', async () => {
+  await assert.rejects(
+    tool.traverseLibraryTree(async () => ({ items: [], cursor: 'next' }), { maxPagesPerDirectory: 1 }),
+    /目录页数超过安全上限/,
+  );
+  let directoryPage = 0;
+  await assert.rejects(
+    tool.traverseLibraryTree(async () => ({ items: [{ kind: 'directory', id: `libdir_d${++directoryPage}` }], cursor: null }), { maxDirectories: 1 }),
+    /目录数量超过安全上限/,
+  );
+  await assert.rejects(
+    tool.traverseLibraryTree(async () => ({ items: [], cursor: null }), { maxTotalRequests: 0 }),
+    /请求数量超过安全上限/,
   );
 });
 

@@ -19,6 +19,9 @@
   const MAX_CONCURRENCY = 20;
   const MAX_RETRIES = 6;
   const MAX_SCAN_PAGES = 500;
+  const MAX_PAGES_PER_DIRECTORY = 500;
+  const MAX_DIRECTORIES = 10_000;
+  const MAX_TOTAL_REQUESTS = 20_000;
   const MAX_EVENTS = 500;
   const MAX_RESPONSE_TEXT = 8_000_000;
   const REDACTED = '[REDACTED]';
@@ -31,6 +34,7 @@
     'created_at', 'createdAt', 'created_at_utc', 'createdAtUtc',
     'created_time', 'createdTime', 'create_time', 'createTime',
     'uploaded_at', 'uploadedAt', 'upload_time', 'uploadTime',
+    'file_processed_time', 'fileProcessedTime',
   ];
   const SIZE_KEYS = ['size_bytes', 'sizeBytes', 'file_size_bytes', 'fileSizeBytes', 'size'];
   const SENSITIVE_HEADER_RE = /(?:authorization|cookie|set-cookie|csrf|xsrf|account[-_]?id|session|credential|api[-_]?key|access[-_]?token|refresh[-_]?token|jwt|sentinel)/i;
@@ -489,6 +493,10 @@
   }
 
   function buildLibraryNodesUrl(parentDirectoryId = null, cursor = null) {
+    if (isObject(parentDirectoryId)) {
+      cursor = parentDirectoryId.cursor ?? null;
+      parentDirectoryId = parentDirectoryId.parentDirectoryId ?? null;
+    }
     const url = new URL('/backend-api/files/library/nodes', 'https://chatgpt.com/');
     url.searchParams.set('include_saved_entities', 'true');
     url.searchParams.set('include_folder_counts', 'true');
@@ -509,15 +517,26 @@
     const directoryQueue = [{ parentDirectoryId: null, cursor: null }];
     const visitedStates = new Set();
     const queuedDirectories = new Set();
+    const pagesByDirectory = new Map();
+    const maxPagesPerDirectory = options.maxPagesPerDirectory ?? MAX_PAGES_PER_DIRECTORY;
+    const maxDirectories = options.maxDirectories ?? MAX_DIRECTORIES;
+    const maxTotalRequests = options.maxTotalRequests ?? MAX_TOTAL_REQUESTS;
     let pages = 0;
+    let requests = 0;
 
     while (directoryQueue.length) {
       if (options.shouldStop?.()) throw new Error('STOP_REQUESTED');
+      if (requests >= maxTotalRequests) throw new Error('请求数量超过安全上限。');
       const state = directoryQueue.shift();
       const stateKey = `${state.parentDirectoryId || 'ROOT'}::${state.cursor || 'FIRST'}`;
       if (visitedStates.has(stateKey)) throw new Error(`重复的目录分页状态：${stateKey}`);
       visitedStates.add(stateKey);
 
+      const directoryKey = state.parentDirectoryId || 'ROOT';
+      const directoryPages = (pagesByDirectory.get(directoryKey) || 0) + 1;
+      if (directoryPages > maxPagesPerDirectory) throw new Error(`目录页数超过安全上限：${directoryKey}`);
+      pagesByDirectory.set(directoryKey, directoryPages);
+      requests += 1;
       const parsed = parseLibraryNodesPayload(await fetchPage(state.parentDirectoryId, state.cursor));
       pages += 1;
       for (const item of parsed.items) {
@@ -527,15 +546,16 @@
           if (item.id.startsWith('external-gdrive:') || item.name === 'Google Drive') continue;
           if (item.id === state.parentDirectoryId) throw new Error(`检测到目录自引用：${item.id}`);
           if (!queuedDirectories.has(item.id)) {
+            if (queuedDirectories.size >= maxDirectories) throw new Error('目录数量超过安全上限。');
             queuedDirectories.add(item.id);
             directoryQueue.push({ parentDirectoryId: item.id, cursor: null });
           }
         }
       }
-      options.onPage?.({ parentDirectoryId: state.parentDirectoryId, cursor: state.cursor, nextCursor: parsed.cursor, pages, files: files.size, pending: directoryQueue.length });
+      options.onPage?.({ parentDirectoryId: state.parentDirectoryId, cursor: state.cursor, nextCursor: parsed.cursor, directoryComplete: parsed.cursor === null, pages, files: files.size, pending: directoryQueue.length });
       if (parsed.cursor !== null) directoryQueue.unshift({ parentDirectoryId: state.parentDirectoryId, cursor: parsed.cursor });
     }
-    return { files: [...files.values()], pages, complete: true };
+    return { files: [...files.values()], pages, requests, directories: queuedDirectories.size, complete: true };
   }
 
   function chooseScanSeed(events) {
@@ -611,6 +631,12 @@
       seedEventId: 0,
       rule: null,
       pageCount: 0,
+      requestCount: 0,
+      processedDirectories: 0,
+      pendingDirectories: 0,
+      directoryPageCount: 0,
+      currentDirectoryId: null,
+      currentCursor: null,
     },
   };
 
@@ -961,7 +987,16 @@
       },
       {
         shouldStop: () => state.stopRequested,
-        onPage: ({ pages }) => { state.scan.pageCount = pages; updateUi(); },
+        onPage: ({ parentDirectoryId, cursor, nextCursor, directoryComplete, pages, pending }) => {
+          state.scan.pageCount = pages;
+          state.scan.requestCount = pages;
+          state.scan.currentDirectoryId = parentDirectoryId;
+          state.scan.currentCursor = nextCursor || cursor || null;
+          state.scan.pendingDirectories = pending;
+          state.scan.directoryPageCount = pages;
+          if (directoryComplete) state.scan.processedDirectories += 1;
+          updateUi();
+        },
       },
     );
     for (const record of result.files) state.scan.records.set(record.libraryFileId, record);
@@ -1087,6 +1122,12 @@
     state.scan.seedEventId = seed.id;
     state.scan.rule = null;
     state.scan.pageCount = 1;
+    state.scan.requestCount = 0;
+    state.scan.processedDirectories = 0;
+    state.scan.pendingDirectories = 0;
+    state.scan.directoryPageCount = 0;
+    state.scan.currentDirectoryId = null;
+    state.scan.currentCursor = null;
     for (const event of scanEvents()) integrateEventRecords(event);
     state.scan.pageCount = Math.max(1, scanEvents().length);
     updateUi();
@@ -1245,6 +1286,15 @@
       root.alert(`完整扫描后，没有发现创建时间早于 ${dateText} 的可删除本地 Library 文件。`);
       return;
     }
+    const invalidTarget = targets.find((record) => (
+      typeof record.libraryFileId !== 'string' || !record.libraryFileId.startsWith('libfile_') ||
+      typeof record.fileId !== 'string' || !record.fileId.startsWith('file_') ||
+      !Number.isFinite(toTimestamp(record.createdAt)) || record.externalProvider
+    ));
+    if (invalidTarget) {
+      root.alert('删除前一致性检查失败：存在身份、日期或来源无法确认的目标，已阻止整批删除。');
+      return;
+    }
     const bytes = targets.reduce((sum, record) => sum + (Number(record.sizeBytes) || 0), 0);
     const confirmed = root.confirm(
       `ChatGPT Library 高速清理\n\n` +
@@ -1326,6 +1376,11 @@
         signature: state.scan.signature,
         learned_rule: state.scan.rule,
         record_count: state.scan.records.size,
+        request_count: state.scan.requestCount,
+        processed_directories: state.scan.processedDirectories,
+        pending_directories: state.scan.pendingDirectories,
+        current_directory_id: state.scan.currentDirectoryId,
+        current_cursor: state.scan.currentCursor,
         oldest_date: oldestDateText(),
       },
       events: state.diagnostics,
@@ -1370,6 +1425,10 @@
     const scanned = root.document.getElementById('cgpt-lib-tool-scanned');
     const oldest = root.document.getElementById('cgpt-lib-tool-oldest');
     const mode = root.document.getElementById('cgpt-lib-tool-mode');
+    const dirs = root.document.getElementById('cgpt-lib-tool-dirs');
+    const pendingDirs = root.document.getElementById('cgpt-lib-tool-pending-dirs');
+    const requests = root.document.getElementById('cgpt-lib-tool-requests');
+    const cursor = root.document.getElementById('cgpt-lib-tool-cursor');
     const status = root.document.getElementById('cgpt-lib-tool-status');
     const scanBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="scan"]');
     const deleteBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="delete"]');
@@ -1384,6 +1443,10 @@
     if (scanned) scanned.textContent = String(state.scan.records.size);
     if (oldest) oldest.textContent = oldestDateText();
     if (mode) mode.textContent = state.scan.mode || 'idle';
+    if (dirs) dirs.textContent = String(state.scan.processedDirectories);
+    if (pendingDirs) pendingDirs.textContent = String(state.scan.pendingDirectories);
+    if (requests) requests.textContent = String(state.scan.requestCount);
+    if (cursor) cursor.textContent = state.scan.currentCursor ? String(state.scan.currentCursor).slice(0, 36) : 'null';
     if (status) {
       if (state.stopRequested && (state.scanning || state.deleting)) status.innerHTML = '<b>正在停止…</b>';
       else if (state.scanning) status.innerHTML = `<b>扫描中</b>：${state.scan.records.size} 个，网络请求中 ${state.inflight}`;
@@ -1436,6 +1499,10 @@
         <div>扫描文件：<b id="cgpt-lib-tool-scanned">0</b></div>
         <div style="grid-column:1 / 3">最早日期：<b id="cgpt-lib-tool-oldest">未知</b></div>
         <div style="grid-column:1 / 3">扫描模式：<b id="cgpt-lib-tool-mode">idle</b></div>
+        <div>已处理目录：<b id="cgpt-lib-tool-dirs">0</b></div>
+        <div>待处理目录：<b id="cgpt-lib-tool-pending-dirs">0</b></div>
+        <div>总请求：<b id="cgpt-lib-tool-requests">0</b></div>
+        <div>当前 cursor：<b id="cgpt-lib-tool-cursor">null</b></div>
         <div style="grid-column:1 / 3;color:#fbbf24">删除接口：未进行真实单文件验证</div>
       </div>
       <div id="cgpt-lib-tool-status" style="padding:8px 9px;background:#1f2937;border-radius:8px;margin-bottom:10px">等待操作。</div>
