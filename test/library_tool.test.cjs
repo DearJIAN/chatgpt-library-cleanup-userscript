@@ -116,10 +116,10 @@ test('fails closed when directory or total request safety limits are exceeded', 
 test('selects strict cutoff, preserves unknown dates and external files', () => {
   const cutoff = tool.inclusiveCutoffExclusiveEndMs('2026-08-01');
   const records = [
-    { libraryFileId: 'libfile_old', fileId: 'file_old', createdAt: '2026-07-31T15:59:59Z' },
-    { libraryFileId: 'libfile_edge', fileId: 'file_edge', createdAt: '2026-08-01T12:00:00' },
-    { libraryFileId: 'libfile_unknown', fileId: 'file_unknown', createdAt: null },
-    { libraryFileId: 'libfile_external', fileId: 'file_external', createdAt: '2020-01-01Z', externalProvider: 'google_drive' },
+    { libraryFileId: 'libfile_old', fileId: 'file_old', createdAt: '2026-07-31T15:59:59Z', deletionAt: '2026-07-31T15:59:59Z' },
+    { libraryFileId: 'libfile_edge', fileId: 'file_edge', createdAt: '2026-08-01T12:00:00', deletionAt: '2026-08-01T12:00:00' },
+    { libraryFileId: 'libfile_unknown', fileId: 'file_unknown', createdAt: null, deletionAt: null },
+    { libraryFileId: 'libfile_external', fileId: 'file_external', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: 'google_drive' },
   ];
   const selection = tool.selectDeletionTargets(records, cutoff);
   assert.deepEqual(selection.targets.map(x => x.libraryFileId), ['libfile_old', 'libfile_edge']);
@@ -154,8 +154,8 @@ test('uses one file ID rule for scan and delete validation', () => {
   assert.equal(tool.isValidFileId('file_abc'), true);
   assert.equal(tool.isValidFileId('file-abc'), true);
   assert.equal(tool.isValidFileId('arbitrary-id'), false);
-  assert.equal(tool.validateDeletionTarget({ libraryFileId: 'libfile_a', fileId: 'file_abc', createdAt: '2026-07-31T00:00:00Z', externalProvider: '' }).valid, true);
-  assert.equal(tool.validateDeletionTarget({ libraryFileId: 'libfile_a', fileId: 'file-abc', createdAt: '2026-07-31T00:00:00Z', externalProvider: '' }).valid, true);
+  assert.equal(tool.validateDeletionTarget({ libraryFileId: 'libfile_a', fileId: 'file_abc', createdAt: '2026-07-31T00:00:00Z', deletionAt: '2026-07-31T00:00:00Z', externalProvider: '' }).valid, true);
+  assert.equal(tool.validateDeletionTarget({ libraryFileId: 'libfile_a', fileId: 'file-abc', createdAt: '2026-07-31T00:00:00Z', deletionAt: '2026-07-31T00:00:00Z', externalProvider: '' }).valid, true);
   assert.equal(tool.validateDeletionTarget({ libraryFileId: 'libfile_a', fileId: 'arbitrary-id', createdAt: '2026-07-31T00:00:00Z', externalProvider: '' }).valid, false);
 });
 
@@ -185,7 +185,7 @@ test('exposes page records before the next cursor is scheduled', async () => {
 
 test('delete queue accepts valid old files immediately and deduplicates them', () => {
   const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
-  const old = { libraryFileId: 'libfile_old', fileId: 'file-old', createdAt: '2026-07-31T00:00:00Z', externalProvider: '' };
+  const old = { libraryFileId: 'libfile_old', fileId: 'file-old', createdAt: '2026-07-31T00:00:00Z', deletionAt: '2026-07-31T00:00:00Z', externalProvider: '' };
   const drive = { ...old, libraryFileId: 'libfile_drive', fileId: 'file-drive', externalProvider: 'google_drive' };
   assert.equal(queue.enqueue([old, old, drive]), 1);
   assert.deepEqual(queue.snapshot().queued.map((x) => x.fileId), ['file-old']);
@@ -194,9 +194,9 @@ test('delete queue accepts valid old files immediately and deduplicates them', (
 test('streaming delete probes one target before starting the remaining workers', async () => {
   const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
   queue.enqueue([
-    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', externalProvider: '' },
-    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', externalProvider: '' },
-    { libraryFileId: 'libfile_c', fileId: 'file_c', createdAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_c', fileId: 'file_c', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' },
   ]);
   queue.close();
   const started = [];
@@ -212,8 +212,8 @@ test('streaming delete probes one target before starting the remaining workers',
 test('failed delete probe prevents all later delete requests', async () => {
   const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
   queue.enqueue([
-    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', externalProvider: '' },
-    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' },
   ]);
   queue.close();
   const started = [];
@@ -227,8 +227,8 @@ test('failed delete probe prevents all later delete requests', async () => {
 test('stop prevents new claims while an in-flight delete is allowed to finish', async () => {
   const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
   queue.enqueue([
-    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', externalProvider: '' },
-    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_a', fileId: 'file_a', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' },
+    { libraryFileId: 'libfile_b', fileId: 'file_b', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' },
   ]);
   queue.close();
   let stopped = false;
@@ -243,7 +243,7 @@ test('stop prevents new claims while an in-flight delete is allowed to finish', 
 
 test('concurrency=1 still processes every target after the probe', async () => {
   const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
-  const records = ['a', 'b', 'c'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', externalProvider: '' }));
+  const records = ['a', 'b', 'c'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' }));
   queue.enqueue(records); queue.close();
   const seen = [];
   const result = await tool.runDeleteQueuePipeline({ queue, concurrency: 1, deleteOne: async (record) => seen.push(record.fileId) });
@@ -253,7 +253,7 @@ test('concurrency=1 still processes every target after the probe', async () => {
 
 test('concurrency=10 starts ten post-probe workers', async () => {
   const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
-  const records = Array.from({ length: 11 }, (_, i) => ({ libraryFileId: `libfile_${i}`, fileId: `file_${i}`, createdAt: '2020-01-01Z', externalProvider: '' }));
+  const records = Array.from({ length: 11 }, (_, i) => ({ libraryFileId: `libfile_${i}`, fileId: `file_${i}`, createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' }));
   queue.enqueue(records); queue.close();
   let active = 0; let maxActive = 0;
   const result = await tool.runDeleteQueuePipeline({
@@ -268,7 +268,7 @@ test('verification passes restart from fresh scans, stop at zero, and cap at thr
   let scans = 0; let deletes = 0;
   const result = await tool.runVerificationPasses({
     maxPasses: 3,
-    scan: async () => ({ complete: true, targets: scans++ < 2 ? [{ libraryFileId: `libfile_${scans}`, fileId: `file_${scans}`, createdAt: '2020-01-01Z', externalProvider: '' }] : [] }),
+    scan: async () => ({ complete: true, targets: scans++ < 2 ? [{ libraryFileId: `libfile_${scans}`, fileId: `file_${scans}`, createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' }] : [] }),
     deleteTargets: async (targets) => { deletes += targets.length; return { deletedIds: targets.map((x) => x.libraryFileId) }; },
   });
   assert.equal(result.complete, true);
@@ -278,7 +278,7 @@ test('verification passes restart from fresh scans, stop at zero, and cap at thr
   let cappedScans = 0;
   const capped = await tool.runVerificationPasses({
     maxPasses: 3,
-    scan: async () => ({ complete: true, targets: [{ libraryFileId: `libfile_repeat_${++cappedScans}`, fileId: 'file_repeat', createdAt: '2020-01-01Z', externalProvider: '' }] }),
+    scan: async () => ({ complete: true, targets: [{ libraryFileId: `libfile_repeat_${++cappedScans}`, fileId: 'file_repeat', createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' }] }),
     deleteTargets: async () => ({ deletedIds: [] }),
   });
   assert.equal(capped.complete, false);
@@ -287,7 +287,7 @@ test('verification passes restart from fresh scans, stop at zero, and cap at thr
 
 test('pauses after the first successful probe until the user confirms', async () => {
   const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
-  queue.enqueue(['a', 'b', 'c'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', externalProvider: '' })));
+  queue.enqueue(['a', 'b', 'c'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' })));
   queue.close();
   const seen = [];
   const result = await tool.runDeleteQueuePipeline({
@@ -302,7 +302,7 @@ test('pauses after the first successful probe until the user confirms', async ()
 
 test('a verified session starts workers without asking again', async () => {
   const queue = tool.createDeleteQueue({ cutoffMs: tool.localCutoffMs('2026-08-01') });
-  queue.enqueue(['a', 'b'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', externalProvider: '' })));
+  queue.enqueue(['a', 'b'].map((id) => ({ libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: '2020-01-01Z', deletionAt: '2020-01-01Z', externalProvider: '' })));
   queue.close();
   const seen = [];
   const result = await tool.runDeleteQueuePipeline({
@@ -360,8 +360,8 @@ test('invalid filename-like UI text is not comparable', () => {
 
 test('time diagnostic samples prioritize differing update and creation times', () => {
   const records = [
-    { libraryFileId: 'libfile_same', fileId: 'file_same', createdAt: '2026-08-01Z', rawTimeEntries: [{ key: 'record_creation_time', path: 'record_creation_time', value: '2026-08-01Z' }, { key: 'updated_at', path: 'updated_at', value: '2026-08-01Z' }] },
-    { libraryFileId: 'libfile_diff', fileId: 'file_diff', createdAt: '2026-08-01Z', rawTimeEntries: [{ key: 'record_creation_time', path: 'record_creation_time', value: '2026-08-01Z' }, { key: 'updated_at', path: 'updated_at', value: '2026-08-18Z' }] },
+    { libraryFileId: 'libfile_same', fileId: 'file_same', createdAt: '2026-08-01Z', deletionAt: '2026-08-01Z', rawTimeEntries: [{ key: 'record_creation_time', path: 'record_creation_time', value: '2026-08-01Z' }, { key: 'updated_at', path: 'updated_at', value: '2026-08-01Z' }] },
+    { libraryFileId: 'libfile_diff', fileId: 'file_diff', createdAt: '2026-08-01Z', deletionAt: '2026-08-01Z', rawTimeEntries: [{ key: 'record_creation_time', path: 'record_creation_time', value: '2026-08-01Z' }, { key: 'updated_at', path: 'updated_at', value: '2026-08-18Z' }] },
   ];
   assert.equal(tool.selectTimeDiagnosticSamples(records, 1)[0].libraryFileId, 'libfile_diff');
 });
@@ -369,7 +369,7 @@ test('time diagnostic samples prioritize differing update and creation times', (
 test('time diagnostic ranking prefers cross-minute and cross-date evidence over same-minute differences', () => {
   const localIso = (text) => new Date(text).toISOString();
   const make = (id, creation, updated) => ({
-    libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: creation,
+    libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: creation, deletionAt: updated,
     rawTimeEntries: [
       { key: 'record_creation_time', path: 'record_creation_time', value: creation },
       { key: 'updated_at', path: 'updated_at', value: updated },
@@ -398,7 +398,7 @@ test('time diagnostic sample ranking tolerates missing and invalid timestamps', 
 test('local-date evidence outranks same-day hour and second-level differences', () => {
   const localIso = (text) => new Date(text).toISOString();
   const make = (id, creation, updated) => ({
-    libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: creation,
+    libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: creation, deletionAt: updated,
     rawTimeEntries: [
       { key: 'record_creation_time', path: 'record_creation_time', value: creation },
       { key: 'updated_at', path: 'updated_at', value: updated },
@@ -498,6 +498,27 @@ test('diagnostic-only modified and processed fields are not deletion fallbacks',
   assert.equal(tool.selectDeletionTargets([record], tool.inclusiveCutoffExclusiveEndMs('2026-08-01')).targets.length, 0);
 });
 
+test('getDeletionTime never falls back to createdAt', () => {
+  assert.equal(tool.getDeletionTime({ createdAt: '2020-01-01T00:00:00Z' }), null);
+  assert.equal(tool.getDeletionTime({ deletionAt: null, createdAt: '2020-01-01T00:00:00Z' }), null);
+  assert.equal(tool.getDeletionTime({ updated_at: '2026-07-01T00:00:00Z' }), '2026-07-01T00:00:00Z');
+  assert.equal(tool.getDeletionTime({ updatedAt: '2026-07-02T00:00:00Z' }), '2026-07-02T00:00:00Z');
+});
+
+test('createdAt-only records fail closed in validation, queue, and selection', () => {
+  const record = { libraryFileId: 'libfile_created_only', fileId: 'file_created_only', createdAt: '2020-01-01T00:00:00Z', externalProvider: '' };
+  const cutoff = tool.inclusiveCutoffExclusiveEndMs('2026-08-01');
+  assert.equal(tool.validateDeletionTarget(record).valid, false);
+  assert.equal(tool.createDeleteQueue({ cutoffMs: cutoff }).enqueue([record]), 0);
+  assert.equal(tool.selectDeletionTargets([record], cutoff).targets.length, 0);
+});
+
+test('diagnostic summary separates creation and deletion time sources', () => {
+  const summary = tool.summarizeTimeDiagnostics([{ createdAtSource: 'record_creation_time', deletionTimeSource: 'updated_at', uiModifiedTimeText: null, uiLikelyMatches: [], reason: 'not currently rendered' }]);
+  assert.equal(summary.createdAtSources.record_creation_time, 1);
+  assert.equal(summary.deletionTimeSources.updated_at, 1);
+});
+
 test('UI matches include full paths and ambiguous entries', () => {
   const result = tool.matchUiTimeFields('8月18日', [
     { key: 'updated_at', path: 'metadata.updated_at', value: '2026-08-18T03:00:00Z' },
@@ -510,12 +531,12 @@ test('UI matches include full paths and ambiguous entries', () => {
   ]);
 });
 
-test('userscript metadata is 0.8.8 and points update/download to the public raw file', () => {
+test('userscript metadata is 0.8.9 and points update/download to the public raw file', () => {
   const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
   const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
   const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
   const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
-  assert.equal(version, '0.8.8');
+  assert.equal(version, '0.8.9');
   assert.equal(scriptVersion, version);
   assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));

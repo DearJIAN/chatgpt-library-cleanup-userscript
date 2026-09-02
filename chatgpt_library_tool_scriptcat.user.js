@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.8
+// @version      0.8.9
 // @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、时间字段诊断、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -17,7 +17,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.8';
+  const SCRIPT_VERSION = '0.8.9';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -89,7 +89,7 @@
     if (Object.prototype.hasOwnProperty.call(record || {}, 'deletionAt')) return record.deletionAt;
     if (Object.prototype.hasOwnProperty.call(record || {}, 'updated_at')) return record.updated_at;
     if (Object.prototype.hasOwnProperty.call(record || {}, 'updatedAt')) return record.updatedAt;
-    return record?.createdAt;
+    return null;
   }
 
   function validateDeletionTarget(record) {
@@ -794,10 +794,12 @@
   }
 
   function summarizeTimeDiagnostics(items) {
-    const summary = { sampleCount: items.length, uiComparableCount: 0, likelyMatches: {}, ambiguous: 0, createdAtSources: {}, highInformationSampleCount: 0, renderedHighInformationSampleCount: 0, distinguishableUiSampleCount: 0, localDateDistinguishableSampleCount: 0, renderedLocalDateDistinguishableSampleCount: 0 };
+    const summary = { sampleCount: items.length, uiComparableCount: 0, likelyMatches: {}, ambiguous: 0, createdAtSources: {}, deletionTimeSources: {}, highInformationSampleCount: 0, renderedHighInformationSampleCount: 0, distinguishableUiSampleCount: 0, localDateDistinguishableSampleCount: 0, renderedLocalDateDistinguishableSampleCount: 0 };
     for (const item of items) {
       const source = item.createdAtSource || 'unknown';
       summary.createdAtSources[source] = (summary.createdAtSources[source] || 0) + 1;
+      const deletionSource = item.deletionTimeSource || 'unknown';
+      summary.deletionTimeSources[deletionSource] = (summary.deletionTimeSources[deletionSource] || 0) + 1;
       if (isValidUiModifiedTimeText(item.uiModifiedTimeText) || (item.uiModifiedTimeExact && Number.isFinite(toTimestamp(item.uiModifiedTimeExact)))) summary.uiComparableCount += 1;
       if (item.highInformation) {
         summary.highInformationSampleCount += 1;
@@ -1964,7 +1966,7 @@
     if (pre) {
       const summary = summarizeTimeDiagnostics(state.timeFieldDiagnostics);
       const timeNotice = buildTimeDiagnosticNotice(summary);
-      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n本地日期可区分样本：${summary.localDateDistinguishableSampleCount}；已渲染：${summary.renderedLocalDateDistinguishableSampleCount}\n高信息量样本：${summary.highInformationSampleCount}；已渲染：${summary.renderedHighInformationSampleCount}；可唯一区分：${summary.distinguishableUiSampleCount}\n当前删除日期来源：${JSON.stringify(summary.createdAtSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}\n${timeNotice}\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.deletionTimeSource || '未知'}\n路径：${item.deletionTimePath || '未知'}\n值：${item.deletionAt || '未知'}\n匹配：${item.uiLikelyMatches.map((match) => `${match.key} (${match.path})`).join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${(item.rawTimeEntries || []).map((entry) => `${entry.key} @ ${entry.path}: ${entry.value} → 本地 ${item.parsedLocalTimes[entry.path]}`).join('; ')}`).join('\n\n');
+      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n本地日期可区分样本：${summary.localDateDistinguishableSampleCount}；已渲染：${summary.renderedLocalDateDistinguishableSampleCount}\n高信息量样本：${summary.highInformationSampleCount}；已渲染：${summary.renderedHighInformationSampleCount}；可唯一区分：${summary.distinguishableUiSampleCount}\n当前删除日期来源：${JSON.stringify(summary.deletionTimeSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}\n${timeNotice}\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.deletionTimeSource || '未知'}\n路径：${item.deletionTimePath || '未知'}\n值：${item.deletionAt || '未知'}\n匹配：${item.uiLikelyMatches.map((match) => `${match.key} (${match.path})`).join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${(item.rawTimeEntries || []).map((entry) => `${entry.key} @ ${entry.path}: ${entry.value} → 本地 ${item.parsedLocalTimes[entry.path]}`).join('; ')}`).join('\n\n');
       pre.style.display = 'block';
     }
     updateUi();
