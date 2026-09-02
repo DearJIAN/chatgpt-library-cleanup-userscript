@@ -4,6 +4,81 @@
 
 项目早期没有建立独立 CHANGELOG，以下内容根据现有 Git 提交历史补录。
 
+## [0.9.1] - 2026-09-02
+
+Commit: `314c3f1` — `Fix verification lifecycle and stale scan records`
+
+### Fixed
+
+- 修复完整扫描复用路径执行 cleanup verification 后 `state.scanning` 可能残留为 `true` 的生命周期问题。
+  - verification scan 统一通过 `withScanningLifecycle` 管理；
+  - 成功、异常和停止都会在 `finally` 中恢复 `state.scanning=false`；
+  - verification 完成后 UI 可以正确进入“清理验证完成”状态，而不会被残留扫描态覆盖。
+- 新增 `pruneDeletedRecords(recordMap, deletedIds)`：真实 soft-delete 成功的 `libraryFileId` 会从当前 `state.scan.records` 中移除，避免 stale target preview 和重复删除。
+- probe 成功后如果用户取消继续批量删除，已经实际删除的 probe 文件也会从 records 中移除，其余未删除记录保留。
+- 部分扫描执行“删除已扫描旧文件”后，成功删除记录会被移除；旧 checkpoint 仍保持失效，后续不会在变化后的 Library 数据集上继续旧 cursor。
+
+### Diagnostics / Safety
+
+- 新增 schema-drift warning：如果当前可唯一区分的 UI 样本明确匹配其他字段而不是已验证的 `updated_at`，面板会提示可能存在 Library schema/UI 行为变化，建议停止批量删除并重新核验时间字段。
+- 不自动切换真实删除字段；`updated_at` fail-closed 语义保持不变。
+
+### Verification
+
+- 自动化测试扩展到 62 项；提交时 62/62 通过。
+- `node --check chatgpt_library_tool_scriptcat.user.js` 与 `git diff --check` 通过。
+
+---
+
+## [0.9.0] - 2026-09-02
+
+Commit: `58659e4` — `Add resumable Library scan state machine`
+
+### Added
+
+- 新增真正的可恢复扫描 checkpoint，不再只依赖单个 `currentCursor`。
+- checkpoint 保存完整 pending frontier、已访问 directory/cursor states、已排队目录、每目录分页计数、现有文件记录、扫描签名和 seed 信息。
+- `Stop → Resume` 在 Library 数据集未发生删除时可以从未完成 frontier 继续，不重复请求已经访问过的 ROOT/目录分页状态。
+
+### Changed
+
+- “自动扫描全部”状态机：
+  - fresh：从 ROOT 开始；
+  - partial + 有效 checkpoint：从断点继续；
+  - complete：不重复扫描。
+- “扫描并删除旧文件”改为三分支：
+  - fresh：保留流式 producer/consumer 扫描 + 删除；
+  - partial + 有效 checkpoint：先续扫到完整，再删除；
+  - complete：直接复用现有完整 `state.scan.records`，删除前不再从 ROOT 重扫。
+- “删除已扫描旧文件”继续保持特殊语义：不继续扫描，只处理当前已经扫描到的 records。
+
+### Safety
+
+- 一旦任何真实删除发生，旧 scan checkpoint 立即失效；因为 Library 数据集已改变，后续不得继续使用清理前的 cursor frontier。
+- cleanup verification 始终从 ROOT fresh scan，这是有意设计的安全边界。
+- 首次真实单文件 soft-delete probe gate 保持不变。
+
+### UI / Diagnostics
+
+- 删除完成后清理 active `deleteQueue`，idle target preview 不再读取历史队列数字。
+- “删除接口”状态由硬编码改为动态显示当前页面 session 是否已通过单文件验证。
+- verification 完成后状态栏显示“清理验证完成”，不再错误回到“扫描完整：可以执行删除”。
+- verification 新 scan pass 会重置目录、分页、请求和 cursor 计数，不与上一轮扫描累加。
+- 删除 cutoff 用户文案统一为“Library 修改时间”，与已验证的 `updated_at` 删除语义一致。
+- 时间诊断不再说“无法确定 UI 修改时间对应字段”；改为明确说明 `updated_at` 已通过可控重命名实验确认，同时区分“当前自然样本没有额外辨识度”与“最终字段未知”。
+
+### Real-world verification
+
+- 2026-09-02 的真实运行中，首次 probe 文件 `Transformer注意力机制信息图解.png` soft-delete 返回成功后，用户实际在 ChatGPT Library 中确认该文件已从主列表消失，之后才继续批量删除。
+- 同轮清理最终成功删除 4 个目标、失败 0；后续 ROOT verification 提示“清理验证完成：未发现遗漏旧文件”。
+
+### Verification
+
+- 自动化测试扩展到 59 项；提交时 59/59 通过。
+- `node --check chatgpt_library_tool_scriptcat.user.js` 与 `git diff --check` 通过。
+
+---
+
 ## [0.8.9] - 2026-09-02
 
 Commit: `4ebc1b0` — `Remove deletion-time fallback and fix diagnostics`
