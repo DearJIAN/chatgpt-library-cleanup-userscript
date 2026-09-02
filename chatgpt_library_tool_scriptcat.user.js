@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.6
+// @version      0.8.7
 // @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、时间字段诊断、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -17,7 +17,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.6';
+  const SCRIPT_VERSION = '0.8.7';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -732,15 +732,24 @@
     const profile = (record) => {
       const fields = ['record_creation_time', 'file_upload_time', 'updated_at', 'file_processed_time'];
       const times = Object.fromEntries(fields.map((key) => [key, toTimestamp(valueOf(record, key))]).filter(([, time]) => Number.isFinite(time)));
+      const localDateGroups = {};
+      for (const [key, time] of Object.entries(times)) {
+        const parts = localDateParts(time);
+        if (!parts) continue;
+        const dateKey = `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+        (localDateGroups[dateKey] ||= []).push(key);
+      }
+      const localDateDistinguishable = Object.keys(localDateGroups).length > 1;
       const distinguishingFields = [];
       let score = 0;
       let strongest = 0;
       const compare = (left, right, points, label) => {
         if (!Number.isFinite(times[left]) || !Number.isFinite(times[right])) return;
         const difference = Math.abs(times[left] - times[right]);
-        const differentDate = new Date(times[left]).toISOString().slice(0, 10) !== new Date(times[right]).toISOString().slice(0, 10);
-        const differentMinute = Math.floor(times[left] / 60_000) !== Math.floor(times[right] / 60_000);
-        const evidence = differentDate ? 4000 : differentMinute ? 3000 : difference >= 60_000 ? 2000 : difference > 0 ? 500 : 0;
+        const leftDate = localDateParts(times[left]);
+        const rightDate = localDateParts(times[right]);
+        const differentDate = leftDate && rightDate && (leftDate.year !== rightDate.year || leftDate.month !== rightDate.month || leftDate.day !== rightDate.day);
+        const evidence = differentDate ? 10000 : difference >= 3_600_000 ? 3000 : difference >= 300_000 ? 1800 : difference >= 60_000 ? 1000 : difference > 0 ? 100 : 0;
         if (evidence > 0) {
           score += evidence + points;
           strongest = Math.max(strongest, evidence);
@@ -753,7 +762,7 @@
       compare('updated_at', 'file_processed_time', 10, 'updated_at → file_processed_time');
       const timeValues = Object.values(times);
       const timeSpreadSeconds = timeValues.length > 1 ? (Math.max(...timeValues) - Math.min(...timeValues)) / 1000 : 0;
-      return { informationScore: score + (visible.has(record.libraryFileId) ? 50 : 0) + (record.parentDirectoryId ? 10 : 0), distinguishingFields, timeSpreadSeconds, highInformation: strongest >= 2000 };
+      return { informationScore: score + (visible.has(record.libraryFileId) ? 50 : 0) + (record.parentDirectoryId ? 10 : 0), distinguishingFields, timeSpreadSeconds, localDateGroups, localDateDistinguishable, highInformation: localDateDistinguishable || strongest >= 1800 };
     };
     return (records || []).filter((record) => validateDeletionTarget(record).valid && !record.externalProvider).map((record, index) => ({ record, index, ...profile(record) })).sort((a, b) => b.informationScore - a.informationScore || a.index - b.index)
       .slice(0, Math.max(1, Math.min(10, limit))).map(({ record, ...info }) => ({ ...record, ...info }));
@@ -767,12 +776,12 @@
       rawTimes: Object.fromEntries(Object.entries(item.rawTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
       rawTimeEntries: (item.rawTimeEntries || []).filter((entry) => RAW_TIME_KEYS.includes(entry.key)).map((entry) => ({ key: entry.key, path: entry.path, value: entry.value })),
       parsedLocalTimes: Object.fromEntries(Object.entries(item.parsedLocalTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
-      uiModifiedTimeText: item.uiModifiedTimeText ?? null, uiModifiedTimeExact: item.uiModifiedTimeExact ?? null, uiLikelyMatches: item.uiLikelyMatches || [], confidence: item.confidence || 'low', ambiguous: Boolean(item.ambiguous), reason: item.reason || null, informationScore: item.informationScore ?? 0, distinguishingFields: item.distinguishingFields || [], timeSpreadSeconds: item.timeSpreadSeconds ?? 0, highInformation: Boolean(item.highInformation),
+      uiModifiedTimeText: item.uiModifiedTimeText ?? null, uiModifiedTimeExact: item.uiModifiedTimeExact ?? null, uiLikelyMatches: item.uiLikelyMatches || [], confidence: item.confidence || 'low', ambiguous: Boolean(item.ambiguous), reason: item.reason || null, informationScore: item.informationScore ?? 0, distinguishingFields: item.distinguishingFields || [], timeSpreadSeconds: item.timeSpreadSeconds ?? 0, localDateGroups: item.localDateGroups || {}, localDateDistinguishable: Boolean(item.localDateDistinguishable), highInformation: Boolean(item.highInformation),
     }));
   }
 
   function summarizeTimeDiagnostics(items) {
-    const summary = { sampleCount: items.length, uiComparableCount: 0, likelyMatches: {}, ambiguous: 0, createdAtSources: {}, highInformationSampleCount: 0, renderedHighInformationSampleCount: 0, distinguishableUiSampleCount: 0 };
+    const summary = { sampleCount: items.length, uiComparableCount: 0, likelyMatches: {}, ambiguous: 0, createdAtSources: {}, highInformationSampleCount: 0, renderedHighInformationSampleCount: 0, distinguishableUiSampleCount: 0, localDateDistinguishableSampleCount: 0, renderedLocalDateDistinguishableSampleCount: 0 };
     for (const item of items) {
       const source = item.createdAtSource || 'unknown';
       summary.createdAtSources[source] = (summary.createdAtSources[source] || 0) + 1;
@@ -780,6 +789,10 @@
       if (item.highInformation) {
         summary.highInformationSampleCount += 1;
         if (item.reason === null && (isValidUiModifiedTimeText(item.uiModifiedTimeText) || (item.uiModifiedTimeExact && Number.isFinite(toTimestamp(item.uiModifiedTimeExact))))) summary.renderedHighInformationSampleCount += 1;
+      }
+      if (item.localDateDistinguishable) {
+        summary.localDateDistinguishableSampleCount += 1;
+        if (item.reason === null && (isValidUiModifiedTimeText(item.uiModifiedTimeText) || (item.uiModifiedTimeExact && Number.isFinite(toTimestamp(item.uiModifiedTimeExact))))) summary.renderedLocalDateDistinguishableSampleCount += 1;
       }
       if (item.ambiguous) summary.ambiguous += 1;
       else if (item.uiLikelyMatches?.length === 1) {
@@ -789,6 +802,12 @@
       }
     }
     return summary;
+  }
+
+  function buildTimeDiagnosticNotice(summary) {
+    if (!summary.localDateDistinguishableSampleCount) return '当前 Library 中未找到候选时间字段跨本地日期的文件。由于当前 UI 对旧文件主要显示日期级时间，现有样本不足以确定 UI 修改时间对应字段。';
+    if (summary.localDateDistinguishableSampleCount > summary.renderedLocalDateDistinguishableSampleCount) return `发现 ${summary.localDateDistinguishableSampleCount} 个候选时间字段跨本地日期的文件，但当前页面仅渲染其中 ${summary.renderedLocalDateDistinguishableSampleCount} 个，暂时无法据此确定 UI 修改时间对应字段。`;
+    return '';
   }
 
   function selectDeletionTargets(records, cutoffMs) {
@@ -960,6 +979,8 @@
     extractUiModifiedTimeFromRows,
     selectTimeDiagnosticSamples,
     sanitizeTimeDiagnostics,
+    summarizeTimeDiagnostics,
+    buildTimeDiagnosticNotice,
     sanitizeJson,
     sanitizeHeaders,
     createDeleteQueue,
@@ -1923,15 +1944,13 @@
     state.timeFieldDiagnostics = candidates.map((record) => {
       const ui = extractUiModifiedTimeFromRows(rows, record, headers);
       const match = (ui.uiModifiedTimeText || ui.uiModifiedTimeExact) ? matchUiTimeFields(ui.uiModifiedTimeText, record.rawTimeEntries || record.rawTimes, ui.uiModifiedTimeExact) : { uiLikelyMatches: [], confidence: 'low', ambiguous: false };
-      return { fileName: record.name, libraryFileId: record.libraryFileId, parentDirectoryId: record.parentDirectoryId, createdAt: record.createdAt, createdAtSource: record.createdAtSource, createdAtPath: record.createdAtPath, rawTimes: record.rawTimes, rawTimeEntries: record.rawTimeEntries, parsedLocalTimes: Object.fromEntries((record.rawTimeEntries || []).map((entry) => [entry.path, localTimeText(entry.value)])), uiModifiedTimeText: ui.uiModifiedTimeText, uiModifiedTimeExact: ui.uiModifiedTimeExact, reason: ui.reason, informationScore: record.informationScore, distinguishingFields: record.distinguishingFields, timeSpreadSeconds: record.timeSpreadSeconds, highInformation: record.highInformation, ...match };
+      return { fileName: record.name, libraryFileId: record.libraryFileId, parentDirectoryId: record.parentDirectoryId, createdAt: record.createdAt, createdAtSource: record.createdAtSource, createdAtPath: record.createdAtPath, rawTimes: record.rawTimes, rawTimeEntries: record.rawTimeEntries, parsedLocalTimes: Object.fromEntries((record.rawTimeEntries || []).map((entry) => [entry.path, localTimeText(entry.value)])), uiModifiedTimeText: ui.uiModifiedTimeText, uiModifiedTimeExact: ui.uiModifiedTimeExact, reason: ui.reason, informationScore: record.informationScore, distinguishingFields: record.distinguishingFields, timeSpreadSeconds: record.timeSpreadSeconds, localDateGroups: record.localDateGroups, localDateDistinguishable: record.localDateDistinguishable, highInformation: record.highInformation, ...match };
     });
     const pre = root.document.getElementById('cgpt-lib-tool-time-diagnostic');
     if (pre) {
       const summary = summarizeTimeDiagnostics(state.timeFieldDiagnostics);
-      const highInfoNotice = summary.highInformationSampleCount > summary.distinguishableUiSampleCount
-        ? `\n发现 ${summary.highInformationSampleCount} 个后台时间字段存在明显差异的高信息量文件，但当前页面仅渲染其中 ${summary.renderedHighInformationSampleCount} 个，暂时无法据此确定 UI 修改时间对应字段。\n`
-        : '';
-      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n高信息量样本：${summary.highInformationSampleCount}；已渲染：${summary.renderedHighInformationSampleCount}；可唯一区分：${summary.distinguishableUiSampleCount}\n当前删除日期来源：${JSON.stringify(summary.createdAtSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}${highInfoNotice}\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.createdAtSource || '未知'}\n路径：${item.createdAtPath || '未知'}\n值：${item.createdAt || '未知'}\n匹配：${item.uiLikelyMatches.map((match) => `${match.key} (${match.path})`).join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${(item.rawTimeEntries || []).map((entry) => `${entry.key} @ ${entry.path}: ${entry.value} → 本地 ${item.parsedLocalTimes[entry.path]}`).join('; ')}`).join('\n\n');
+      const timeNotice = buildTimeDiagnosticNotice(summary);
+      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n本地日期可区分样本：${summary.localDateDistinguishableSampleCount}；已渲染：${summary.renderedLocalDateDistinguishableSampleCount}\n高信息量样本：${summary.highInformationSampleCount}；已渲染：${summary.renderedHighInformationSampleCount}；可唯一区分：${summary.distinguishableUiSampleCount}\n当前删除日期来源：${JSON.stringify(summary.createdAtSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}\n${timeNotice}\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.createdAtSource || '未知'}\n路径：${item.createdAtPath || '未知'}\n值：${item.createdAt || '未知'}\n匹配：${item.uiLikelyMatches.map((match) => `${match.key} (${match.path})`).join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${(item.rawTimeEntries || []).map((entry) => `${entry.key} @ ${entry.path}: ${entry.value} → 本地 ${item.parsedLocalTimes[entry.path]}`).join('; ')}`).join('\n\n');
       pre.style.display = 'block';
     }
     updateUi();

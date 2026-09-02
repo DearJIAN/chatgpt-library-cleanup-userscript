@@ -367,6 +367,7 @@ test('time diagnostic samples prioritize differing update and creation times', (
 });
 
 test('time diagnostic ranking prefers cross-minute and cross-date evidence over same-minute differences', () => {
+  const localIso = (text) => new Date(text).toISOString();
   const make = (id, creation, updated) => ({
     libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: creation,
     rawTimeEntries: [
@@ -377,7 +378,7 @@ test('time diagnostic ranking prefers cross-minute and cross-date evidence over 
   const samples = tool.selectTimeDiagnosticSamples([
     make('same-minute', '2026-08-30T10:01:10Z', '2026-08-30T10:01:50Z'),
     make('cross-minute', '2026-08-30T10:01:10Z', '2026-08-30T10:05:00Z'),
-    make('cross-date', '2026-08-30T23:59:00Z', '2026-08-31T00:01:00Z'),
+    make('cross-date', localIso('2026-08-30T23:59:00'), localIso('2026-08-31T00:01:00')),
   ], 3);
   assert.deepEqual(samples.map((item) => item.libraryFileId), ['libfile_cross-date', 'libfile_cross-minute', 'libfile_same-minute']);
   assert.ok(samples[0].informationScore > samples[1].informationScore);
@@ -392,6 +393,37 @@ test('time diagnostic sample ranking tolerates missing and invalid timestamps', 
       { key: 'updated_at', path: 'updated_at', value: 'also-not-a-date' },
     ] },
   ]));
+});
+
+test('local-date evidence outranks same-day hour and second-level differences', () => {
+  const localIso = (text) => new Date(text).toISOString();
+  const make = (id, creation, updated) => ({
+    libraryFileId: `libfile_${id}`, fileId: `file_${id}`, createdAt: creation,
+    rawTimeEntries: [
+      { key: 'record_creation_time', path: 'record_creation_time', value: creation },
+      { key: 'updated_at', path: 'updated_at', value: updated },
+    ],
+  });
+  const samples = tool.selectTimeDiagnosticSamples([
+    make('one-second-boundary', localIso('2026-08-30T14:56:59'), localIso('2026-08-30T14:57:00')),
+    make('three-hours', localIso('2026-08-30T10:00:00'), localIso('2026-08-30T13:00:00')),
+    make('local-date', localIso('2026-08-30T23:58:00'), localIso('2026-08-31T00:03:00')),
+  ], 3);
+  assert.equal(samples[0].libraryFileId, 'libfile_local-date');
+  assert.equal(samples[0].localDateDistinguishable, true);
+  assert.ok(samples[0].localDateGroups);
+  assert.ok(samples[1].informationScore > samples[2].informationScore);
+  assert.equal(samples[2].localDateDistinguishable, false);
+});
+
+test('diagnostic summary reports local-date evidence and evidence insufficiency', () => {
+  const summary = tool.summarizeTimeDiagnostics([
+    { highInformation: true, localDateDistinguishable: true, reason: 'not currently rendered', uiModifiedTimeText: null, uiLikelyMatches: [], createdAtSource: 'record_creation_time' },
+    { highInformation: false, localDateDistinguishable: false, reason: null, uiModifiedTimeText: '星期日', uiLikelyMatches: [], createdAtSource: 'record_creation_time' },
+  ]);
+  assert.equal(summary.localDateDistinguishableSampleCount, 1);
+  assert.equal(summary.renderedLocalDateDistinguishableSampleCount, 0);
+  assert.match(tool.buildTimeDiagnosticNotice({ ...summary, localDateDistinguishableSampleCount: 0 }), /未找到候选时间字段跨本地日期/);
 });
 
 test('time diagnostic export contains no sensitive fields', () => {
@@ -436,12 +468,12 @@ test('UI matches include full paths and ambiguous entries', () => {
   ]);
 });
 
-test('userscript metadata is 0.8.6 and points update/download to the public raw file', () => {
+test('userscript metadata is 0.8.7 and points update/download to the public raw file', () => {
   const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
   const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
   const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
   const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
-  assert.equal(version, '0.8.6');
+  assert.equal(version, '0.8.7');
   assert.equal(scriptVersion, version);
   assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
