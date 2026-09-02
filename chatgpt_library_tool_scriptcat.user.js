@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.9.0
+// @version      0.9.1
 // @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、时间字段诊断、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -17,7 +17,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.9.0';
+  const SCRIPT_VERSION = '0.9.1';
   const VERIFIED_UI_MODIFIED_TIME_FIELD = 'updated_at';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
@@ -823,6 +823,7 @@
 
   function buildTimeDiagnosticNotice(summary) {
     if ((summary.likelyMatches?.[VERIFIED_UI_MODIFIED_TIME_FIELD] || 0) >= 1 && summary.distinguishableUiSampleCount > 0) return '当前可唯一区分样本与已验证结论一致：Library UI 修改时间匹配 updated_at。';
+    if (summary.distinguishableUiSampleCount > 0 && !(summary.likelyMatches?.[VERIFIED_UI_MODIFIED_TIME_FIELD] || 0) && Object.keys(summary.likelyMatches || {}).length > 0) return '警告：当前可唯一区分 UI 样本与已验证的 updated_at 映射不一致，可能存在 Library schema/UI 行为变化。建议停止批量删除并重新核验时间字段。';
     if (!summary.localDateDistinguishableSampleCount) return '当前扫描未找到候选时间字段跨本地日期的自然样本；Library UI 修改时间 = updated_at 已通过可控重命名实验确认，本提示仅说明本轮自然样本缺乏额外区分度。';
     if (summary.localDateDistinguishableSampleCount > summary.renderedLocalDateDistinguishableSampleCount) return `发现 ${summary.localDateDistinguishableSampleCount} 个候选时间字段跨本地日期的自然样本，其中 ${summary.renderedLocalDateDistinguishableSampleCount} 个当前已渲染；Library UI 修改时间 = updated_at 已通过可控重命名实验确认。`;
     return '';
@@ -920,6 +921,26 @@
 
   function invalidateScanCheckpoint() {
     return null;
+  }
+
+  function pruneDeletedRecords(recordMap, deletedIds) {
+    if (!(recordMap instanceof Map)) throw new TypeError('记录集合必须是 Map。');
+    const ids = deletedIds instanceof Set ? deletedIds : Array.isArray(deletedIds) ? new Set(deletedIds) : new Set();
+    let removed = 0;
+    for (const id of ids) if (recordMap.delete(id)) removed += 1;
+    return removed;
+  }
+
+  async function withScanningLifecycle(setScanning, onStateChange, work) {
+    if (typeof setScanning !== 'function' || typeof work !== 'function') throw new Error('扫描生命周期参数无效。');
+    setScanning(true);
+    onStateChange?.();
+    try {
+      return await work();
+    } finally {
+      setScanning(false);
+      onStateChange?.();
+    }
   }
 
   function decideScanDeleteAction({ recordCount = 0, scanComplete = false, checkpointValid = false, datasetMutated = false } = {}) {
@@ -1066,6 +1087,8 @@
     isValidScanCheckpoint,
     createScanCheckpoint,
     invalidateScanCheckpoint,
+    pruneDeletedRecords,
+    withScanningLifecycle,
     decideScanDeleteAction,
     traverseLibraryTree,
   };
@@ -1788,15 +1811,18 @@
 
   async function runFullCleanupVerification(seed, cutoffMs, concurrency, deletedIds) {
     const verification = await runVerificationPasses({
-      scan: async () => {
-        if (state.stopRequested) return { complete: false, targets: [] };
-        const freshSeed = await fetchLibraryNodes(buildLibraryNodesUrl(null, null), seed);
-        resetScanPass(freshSeed, { mode: 'verification：从 ROOT 重新扫描' });
-        state.scanning = true;
-        const complete = await directLibraryTreeScan(freshSeed);
-        state.scan.complete = complete;
-        return { complete, targets: complete ? selectDeletionTargets([...state.scan.records.values()], cutoffMs).targets : [] };
-      },
+      scan: async () => withScanningLifecycle(
+        (value) => { state.scanning = value; },
+        updateUi,
+        async () => {
+          if (state.stopRequested) return { complete: false, targets: [] };
+          const freshSeed = await fetchLibraryNodes(buildLibraryNodesUrl(null, null), seed);
+          resetScanPass(freshSeed, { mode: 'verification：从 ROOT 重新扫描' });
+          const complete = await directLibraryTreeScan(freshSeed);
+          state.scan.complete = complete;
+          return { complete, targets: complete ? selectDeletionTargets([...state.scan.records.values()], cutoffMs).targets : [] };
+        },
+      ),
       deleteTargets: async (targets) => {
         const verificationQueue = createDeleteQueue({ cutoffMs });
         verificationQueue.enqueue(targets);
@@ -1811,6 +1837,7 @@
           });
           const failed = [...verificationDelete.failed];
           if (!verificationDelete.probeSucceeded && !failed.length) failed.push({ error: 'verification delete stopped' });
+          for (const id of verificationQueue.snapshot().deleted) deletedIds.add(id);
           return { deletedIds: verificationQueue.snapshot().deleted, failed };
         } finally {
           if (state.deleteQueue === verificationQueue) state.deleteQueue = null;
@@ -1915,6 +1942,7 @@
       else { state.scan.warning = `删除探测/执行失败：${error?.message || error}`; root.alert(`${state.scan.warning}\n\n已停止后续批量删除，没有继续硬冲。`); }
       return { started: true, deleted: 0, failed: [{ error: String(error?.message || error) }] };
     } finally {
+      pruneDeletedRecords(state.scan.records, deletedIds);
       state.deleteQueue = null;
       state.deleting = false;
       updateUi();
@@ -2034,6 +2062,7 @@
       else { state.scan.warning = `流式扫描失败：${error?.message || error}`; root.alert(state.scan.warning); }
     } finally {
       queue.close();
+      pruneDeletedRecords(state.scan.records, new Set(queue.snapshot().deleted));
       state.deleteQueue = null;
       state.scanning = false;
       state.deleting = false;

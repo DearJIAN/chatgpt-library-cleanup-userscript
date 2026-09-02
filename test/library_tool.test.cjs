@@ -436,6 +436,14 @@ test('verified updated_at notice is explicit when a unique rendered sample match
   assert.match(tool.buildTimeDiagnosticNotice(summary), /已验证结论一致.*updated_at/);
 });
 
+test('diagnostic notice warns when a unique UI sample conflicts with verified updated_at', () => {
+  const summary = tool.summarizeTimeDiagnostics([{
+    highInformation: true, localDateDistinguishable: false, reason: null,
+    uiModifiedTimeText: '22:31', uiLikelyMatches: [{ key: 'record_creation_time', path: 'record_creation_time' }],
+  }]);
+  assert.match(tool.buildTimeDiagnosticNotice(summary), /警告.*updated_at.*不一致/);
+});
+
 test('time diagnostic export contains no sensitive fields', () => {
   const safe = tool.sanitizeTimeDiagnostics([{ fileName: 'a.txt', rawTimes: { updated_at: 'x', Authorization: 'secret', email: 'x@y.test' }, uiModifiedTimeText: null }]);
   assert.equal(JSON.stringify(safe).includes('secret'), false);
@@ -621,12 +629,12 @@ test('UI matches include full paths and ambiguous entries', () => {
   ]);
 });
 
-test('userscript metadata is 0.9.0 and points update/download to the public raw file', () => {
+test('userscript metadata is 0.9.1 and points update/download to the public raw file', () => {
   const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
   const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
   const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
   const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
-  assert.equal(version, '0.9.0');
+  assert.equal(version, '0.9.1');
   assert.equal(scriptVersion, version);
   assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
@@ -643,6 +651,33 @@ test('scan-delete UI and lifecycle do not retain stale active queue state', () =
   assert.match(source, /Library 修改时间在/);
   const startDelete = source.slice(source.indexOf('async function startDelete()'), source.indexOf('async function startDeleteScannedRecords()'));
   assert.doesNotMatch(startDelete, /state\.scan\.records\s*=\s*new Map\(\)/);
+  const verification = source.slice(source.indexOf('async function runFullCleanupVerification'), source.indexOf('async function deleteExistingTargets'));
+  assert.match(verification, /withScanningLifecycle/);
+  const existingDelete = source.slice(source.indexOf('async function deleteExistingTargets'), source.indexOf('async function startDelete()'));
+  assert.match(existingDelete, /finally \{[\s\S]*pruneDeletedRecords\(state\.scan\.records, deletedIds\)/);
+  assert.match(startDelete, /queue\.close\(\);[\s\S]*pruneDeletedRecords\(state\.scan\.records/);
+});
+
+test('pruneDeletedRecords removes only matching library IDs and ignores unknown IDs', () => {
+  const records = new Map([
+    ['libfile_a', { libraryFileId: 'libfile_a' }],
+    ['libfile_b', { libraryFileId: 'libfile_b' }],
+    ['libfile_c', { libraryFileId: 'libfile_c' }],
+  ]);
+  assert.equal(tool.pruneDeletedRecords(records, new Set(['libfile_a', 'libfile_c', 'libfile_missing'])), 2);
+  assert.deepEqual([...records.keys()], ['libfile_b']);
+  assert.equal(tool.pruneDeletedRecords(records, ['libfile_unknown']), 0);
+});
+
+test('scanning lifecycle resets scanning after success and throw', async () => {
+  const states = [];
+  const success = await tool.withScanningLifecycle((value) => states.push(value), () => {}, async () => 'ok');
+  assert.equal(success, 'ok');
+  assert.deepEqual(states, [true, false]);
+
+  states.length = 0;
+  await assert.rejects(tool.withScanningLifecycle((value) => states.push(value), () => {}, async () => { throw new Error('scan failed'); }), /scan failed/);
+  assert.deepEqual(states, [true, false]);
 });
 
 test('recursive diagnostic sanitizer redacts identity fields but preserves library diagnosis fields', () => {
