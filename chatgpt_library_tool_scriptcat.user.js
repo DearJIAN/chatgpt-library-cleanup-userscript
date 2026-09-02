@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.7
+// @version      0.8.8
 // @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、时间字段诊断、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -17,7 +17,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.7';
+  const SCRIPT_VERSION = '0.8.8';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -41,6 +41,7 @@
     'uploaded_at', 'uploadedAt', 'upload_time', 'uploadTime',
     'file_processed_time', 'fileProcessedTime',
   ];
+  const DELETION_TIME_KEYS = ['updated_at', 'updatedAt'];
   const RAW_TIME_KEYS = [
     'record_creation_time', 'recordCreationTime', 'file_upload_time', 'fileUploadTime',
     'created_at', 'createdAt', 'created_at_utc', 'createdAtUtc', 'created_time', 'createdTime',
@@ -84,11 +85,18 @@
     return typeof value === 'string' && /^libfile_/.test(value);
   }
 
+  function getDeletionTime(record) {
+    if (Object.prototype.hasOwnProperty.call(record || {}, 'deletionAt')) return record.deletionAt;
+    if (Object.prototype.hasOwnProperty.call(record || {}, 'updated_at')) return record.updated_at;
+    if (Object.prototype.hasOwnProperty.call(record || {}, 'updatedAt')) return record.updatedAt;
+    return record?.createdAt;
+  }
+
   function validateDeletionTarget(record) {
     const reasons = [];
     if (!isValidLibraryFileId(record?.libraryFileId)) reasons.push('libraryFileId 无效');
     if (!isValidFileId(record?.fileId)) reasons.push('fileId 无效');
-    if (!Number.isFinite(toTimestamp(record?.createdAt))) reasons.push('createdAt 无法解析');
+    if (!Number.isFinite(toTimestamp(getDeletionTime(record)))) reasons.push('删除修改时间 updated_at 无法解析');
     if (record?.externalProvider) reasons.push('externalProvider 非空');
     return { valid: reasons.length === 0, reasons };
   }
@@ -103,7 +111,7 @@
 
     function eligible(record) {
       const validation = validateDeletionTarget(record);
-      return validation.valid && Number.isFinite(cutoffMs) && toTimestamp(record.createdAt) < cutoffMs &&
+      return validation.valid && Number.isFinite(cutoffMs) && toTimestamp(getDeletionTime(record)) < cutoffMs &&
         !queued.has(record.libraryFileId) && !deleted.has(record.libraryFileId);
     }
     function enqueue(records) {
@@ -331,6 +339,7 @@
         if (!fileId && isValidFileId(node.id)) fileId = node.id;
         const name = findScalarByKeys(node, NAME_KEYS, 2);
         const createdResult = findScalarWithSourceByKeys(node, CREATED_KEYS, 2);
+        const deletionResult = findScalarWithSourceByKeys(node, DELETION_TIME_KEYS, 2);
         const createdAt = createdResult?.value ?? null;
         const sizeBytes = findScalarByKeys(node, SIZE_KEYS, 2);
         const rawTimeEntries = collectRawTimeFields(node, RAW_TIME_KEYS, 2);
@@ -347,6 +356,9 @@
             createdAt,
             createdAtSource: createdResult?.key ?? null,
             createdAtPath: createdResult?.path ?? null,
+            deletionAt: deletionResult?.value ?? null,
+            deletionTimeSource: deletionResult?.key ?? null,
+            deletionTimePath: deletionResult?.path ?? null,
             rawTimes,
             rawTimeEntries,
             sizeBytes: Number.isFinite(Number(sizeBytes)) ? Number(sizeBytes) : 0,
@@ -773,6 +785,7 @@
       fileName: item.fileName || null, libraryFileId: item.libraryFileId || null, parentDirectoryId: item.parentDirectoryId || null,
       createdAt: item.createdAt || null, createdAtSource: item.createdAtSource || null,
       createdAtPath: item.createdAtPath || null,
+      deletionAt: item.deletionAt || null, deletionTimeSource: item.deletionTimeSource || null, deletionTimePath: item.deletionTimePath || null,
       rawTimes: Object.fromEntries(Object.entries(item.rawTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
       rawTimeEntries: (item.rawTimeEntries || []).filter((entry) => RAW_TIME_KEYS.includes(entry.key)).map((entry) => ({ key: entry.key, path: entry.path, value: entry.value })),
       parsedLocalTimes: Object.fromEntries(Object.entries(item.parsedLocalTimes || {}).filter(([key]) => RAW_TIME_KEYS.includes(key))),
@@ -819,14 +832,14 @@
         externalCount += 1;
         continue;
       }
-      const created = toTimestamp(record.createdAt);
-      if (!Number.isFinite(created)) {
+      const deletionTime = toTimestamp(getDeletionTime(record));
+      if (!Number.isFinite(deletionTime)) {
         unknownDateCount += 1;
         continue;
       }
-      if (created < cutoffMs) targets.push(record);
+      if (deletionTime < cutoffMs) targets.push(record);
     }
-    targets.sort((a, b) => toTimestamp(a.createdAt) - toTimestamp(b.createdAt));
+    targets.sort((a, b) => toTimestamp(getDeletionTime(a)) - toTimestamp(getDeletionTime(b)));
     return { targets, unknownDateCount, externalCount };
   }
 
@@ -971,6 +984,7 @@
     deleteRetryDelayMs,
     isValidFileId,
     isValidLibraryFileId,
+    getDeletionTime,
     validateDeletionTarget,
     findScalarWithSourceByKeys,
     collectRawTimeFields,
@@ -1886,7 +1900,7 @@
   function oldestDateText() {
     let oldest = Infinity;
     for (const record of state.scan.records.values()) {
-      const ts = toTimestamp(record.createdAt);
+      const ts = toTimestamp(getDeletionTime(record));
       if (Number.isFinite(ts)) oldest = Math.min(oldest, ts);
     }
     return Number.isFinite(oldest) ? new Date(oldest).toLocaleString() : '未知';
@@ -1944,13 +1958,13 @@
     state.timeFieldDiagnostics = candidates.map((record) => {
       const ui = extractUiModifiedTimeFromRows(rows, record, headers);
       const match = (ui.uiModifiedTimeText || ui.uiModifiedTimeExact) ? matchUiTimeFields(ui.uiModifiedTimeText, record.rawTimeEntries || record.rawTimes, ui.uiModifiedTimeExact) : { uiLikelyMatches: [], confidence: 'low', ambiguous: false };
-      return { fileName: record.name, libraryFileId: record.libraryFileId, parentDirectoryId: record.parentDirectoryId, createdAt: record.createdAt, createdAtSource: record.createdAtSource, createdAtPath: record.createdAtPath, rawTimes: record.rawTimes, rawTimeEntries: record.rawTimeEntries, parsedLocalTimes: Object.fromEntries((record.rawTimeEntries || []).map((entry) => [entry.path, localTimeText(entry.value)])), uiModifiedTimeText: ui.uiModifiedTimeText, uiModifiedTimeExact: ui.uiModifiedTimeExact, reason: ui.reason, informationScore: record.informationScore, distinguishingFields: record.distinguishingFields, timeSpreadSeconds: record.timeSpreadSeconds, localDateGroups: record.localDateGroups, localDateDistinguishable: record.localDateDistinguishable, highInformation: record.highInformation, ...match };
+      return { fileName: record.name, libraryFileId: record.libraryFileId, parentDirectoryId: record.parentDirectoryId, createdAt: record.createdAt, createdAtSource: record.createdAtSource, createdAtPath: record.createdAtPath, deletionAt: record.deletionAt, deletionTimeSource: record.deletionTimeSource, deletionTimePath: record.deletionTimePath, rawTimes: record.rawTimes, rawTimeEntries: record.rawTimeEntries, parsedLocalTimes: Object.fromEntries((record.rawTimeEntries || []).map((entry) => [entry.path, localTimeText(entry.value)])), uiModifiedTimeText: ui.uiModifiedTimeText, uiModifiedTimeExact: ui.uiModifiedTimeExact, reason: ui.reason, informationScore: record.informationScore, distinguishingFields: record.distinguishingFields, timeSpreadSeconds: record.timeSpreadSeconds, localDateGroups: record.localDateGroups, localDateDistinguishable: record.localDateDistinguishable, highInformation: record.highInformation, ...match };
     });
     const pre = root.document.getElementById('cgpt-lib-tool-time-diagnostic');
     if (pre) {
       const summary = summarizeTimeDiagnostics(state.timeFieldDiagnostics);
       const timeNotice = buildTimeDiagnosticNotice(summary);
-      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n本地日期可区分样本：${summary.localDateDistinguishableSampleCount}；已渲染：${summary.renderedLocalDateDistinguishableSampleCount}\n高信息量样本：${summary.highInformationSampleCount}；已渲染：${summary.renderedHighInformationSampleCount}；可唯一区分：${summary.distinguishableUiSampleCount}\n当前删除日期来源：${JSON.stringify(summary.createdAtSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}\n${timeNotice}\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.createdAtSource || '未知'}\n路径：${item.createdAtPath || '未知'}\n值：${item.createdAt || '未知'}\n匹配：${item.uiLikelyMatches.map((match) => `${match.key} (${match.path})`).join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${(item.rawTimeEntries || []).map((entry) => `${entry.key} @ ${entry.path}: ${entry.value} → 本地 ${item.parsedLocalTimes[entry.path]}`).join('; ')}`).join('\n\n');
+      pre.textContent = `样本：${summary.sampleCount}；可与 UI 对照：${summary.uiComparableCount}；ambiguous：${summary.ambiguous}\n本地日期可区分样本：${summary.localDateDistinguishableSampleCount}；已渲染：${summary.renderedLocalDateDistinguishableSampleCount}\n高信息量样本：${summary.highInformationSampleCount}；已渲染：${summary.renderedHighInformationSampleCount}；可唯一区分：${summary.distinguishableUiSampleCount}\n当前删除日期来源：${JSON.stringify(summary.createdAtSources)}\nUI 最可能匹配：${JSON.stringify(summary.likelyMatches)}\n${timeNotice}\n` + state.timeFieldDiagnostics.map((item) => `${item.fileName}\nUI 修改时间：${item.uiModifiedTimeText || '未渲染'}\n当前删除字段：${item.deletionTimeSource || '未知'}\n路径：${item.deletionTimePath || '未知'}\n值：${item.deletionAt || '未知'}\n匹配：${item.uiLikelyMatches.map((match) => `${match.key} (${match.path})`).join(', ') || '无法确认'}${item.ambiguous ? '（ambiguous）' : ''}\n原始字段：${(item.rawTimeEntries || []).map((entry) => `${entry.key} @ ${entry.path}: ${entry.value} → 本地 ${item.parsedLocalTimes[entry.path]}`).join('; ')}`).join('\n\n');
       pre.style.display = 'block';
     }
     updateUi();

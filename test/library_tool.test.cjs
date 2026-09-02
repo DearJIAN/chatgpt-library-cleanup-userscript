@@ -456,6 +456,48 @@ test('updated-only fields are diagnostic only and never become createdAt', () =>
   assert.equal(record.rawTimeEntries[0].key, 'updated_at');
 });
 
+test('deletion eligibility uses updated_at rather than creation or upload time', () => {
+  const records = tool.extractFileRecords({ items: [
+    { kind: 'file', id: 'libfile_old-created-new-updated', file_id: 'file_old-created-new-updated', record_creation_time: '2026-07-01T00:00:00Z', file_upload_time: '2026-07-01T00:00:00Z', updated_at: '2026-09-01T00:00:00Z' },
+    { kind: 'file', id: 'libfile_new-created-old-updated', file_id: 'file_new-created-old-updated', record_creation_time: '2026-09-01T00:00:00Z', updated_at: '2026-07-01T00:00:00Z' },
+  ] });
+  const selected = tool.selectDeletionTargets(records, tool.inclusiveCutoffExclusiveEndMs('2026-08-01'));
+  assert.deepEqual(selected.targets.map((record) => record.libraryFileId), ['libfile_new-created-old-updated']);
+  assert.equal(records[0].deletionTimeSource, 'updated_at');
+});
+
+test('delete queue eligibility uses the verified updated_at time', () => {
+  const records = tool.extractFileRecords({ items: [
+    { kind: 'file', id: 'libfile_queue-old-created-new-updated', file_id: 'file_queue-old-created-new-updated', record_creation_time: '2020-01-01T00:00:00Z', updated_at: '2026-09-01T00:00:00Z' },
+    { kind: 'file', id: 'libfile_queue-new-created-old-updated', file_id: 'file_queue-new-created-old-updated', record_creation_time: '2026-09-01T00:00:00Z', updated_at: '2020-01-01T00:00:00Z' },
+  ] });
+  const queue = tool.createDeleteQueue({ cutoffMs: tool.inclusiveCutoffExclusiveEndMs('2026-08-01') });
+  assert.equal(queue.enqueue(records), 1);
+  assert.equal(queue.snapshot().queued.length, 1);
+});
+
+test('missing or invalid updated_at fails closed even when old time fields are present', () => {
+  const records = tool.extractFileRecords({ items: [
+    { kind: 'file', id: 'libfile_missing-updated', file_id: 'file_missing-updated', record_creation_time: '2020-01-01T00:00:00Z' },
+    { kind: 'file', id: 'libfile_null-updated', file_id: 'file_null-updated', record_creation_time: '2020-01-01T00:00:00Z', updated_at: null },
+    { kind: 'file', id: 'libfile_invalid-updated', file_id: 'file_invalid-updated', record_creation_time: '2020-01-01T00:00:00Z', updated_at: 'invalid' },
+  ] });
+  const selected = tool.selectDeletionTargets(records, tool.inclusiveCutoffExclusiveEndMs('2026-08-01'));
+  assert.equal(selected.targets.length, 0);
+  assert.equal(records.some((record) => Number.isFinite(tool.toTimestamp(record.deletionAt))), false);
+});
+
+test('updatedAt camelCase is accepted as the verified deletion time', () => {
+  const [record] = tool.extractFileRecords({ items: [{ kind: 'file', id: 'libfile_camel', file_id: 'file-camel', record_creation_time: '2026-09-01T00:00:00Z', updatedAt: '2026-07-01T00:00:00Z' }] });
+  assert.equal(record.deletionAt, '2026-07-01T00:00:00Z');
+  assert.equal(tool.selectDeletionTargets([record], tool.inclusiveCutoffExclusiveEndMs('2026-08-01')).targets.length, 1);
+});
+
+test('diagnostic-only modified and processed fields are not deletion fallbacks', () => {
+  const [record] = tool.extractFileRecords({ items: [{ kind: 'file', id: 'libfile_no_updated', file_id: 'file-no-updated', record_creation_time: '2020-01-01T00:00:00Z', file_processed_time: '2020-01-01T00:00:00Z', modified_at: '2020-01-01T00:00:00Z' }] });
+  assert.equal(tool.selectDeletionTargets([record], tool.inclusiveCutoffExclusiveEndMs('2026-08-01')).targets.length, 0);
+});
+
 test('UI matches include full paths and ambiguous entries', () => {
   const result = tool.matchUiTimeFields('8月18日', [
     { key: 'updated_at', path: 'metadata.updated_at', value: '2026-08-18T03:00:00Z' },
@@ -468,12 +510,12 @@ test('UI matches include full paths and ambiguous entries', () => {
   ]);
 });
 
-test('userscript metadata is 0.8.7 and points update/download to the public raw file', () => {
+test('userscript metadata is 0.8.8 and points update/download to the public raw file', () => {
   const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
   const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
   const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
   const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
-  assert.equal(version, '0.8.7');
+  assert.equal(version, '0.8.8');
   assert.equal(scriptVersion, version);
   assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
