@@ -2,8 +2,8 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.9.1
-// @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、时间字段诊断、诊断 JSON 导出与随时停止。
+// @version      1.0.0
+// @description  自动捕获 ChatGPT Library 真实接口，按目录树 × 每目录 cursor 全量/断点续扫，按已验证的 updated_at 筛选并执行 soft delete，支持首次单文件验证、补漏扫描与脱敏诊断。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @grant        none
@@ -17,7 +17,7 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.9.1';
+  const SCRIPT_VERSION = '1.0.0';
   const VERIFIED_UI_MODIFIED_TIME_FIELD = 'updated_at';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
