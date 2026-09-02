@@ -2,7 +2,7 @@
 // @name         ChatGPT Library：自动诊断 + 全量扫描 + 高速清理
 // @namespace    DearJIAN
 // @author       DearJIAN / ChatGPT
-// @version      0.8.9
+// @version      0.9.0
 // @description  自动捕获 ChatGPT Library 真实接口，按目录树与 cursor 全量扫描，并支持流式 soft delete、自动验证补漏、时间字段诊断、诊断 JSON 导出与随时停止。
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -17,7 +17,8 @@
 (function universalFactory(root) {
   'use strict';
 
-  const SCRIPT_VERSION = '0.8.9';
+  const SCRIPT_VERSION = '0.9.0';
+  const VERIFIED_UI_MODIFIED_TIME_FIELD = 'updated_at';
   const DEFAULT_CUTOFF = '2026-08-01';
   const DEFAULT_CONCURRENCY = 10;
   const MAX_CONCURRENCY = 20;
@@ -155,7 +156,7 @@
     };
   }
 
-  async function runDeleteQueuePipeline({ queue, concurrency = DEFAULT_CONCURRENCY, deleteOne, shouldStop, onProgress, confirmAfterProbe } = {}) {
+  async function runDeleteQueuePipeline({ queue, concurrency = DEFAULT_CONCURRENCY, deleteOne, shouldStop, onProgress, confirmAfterProbe, onProbeSuccess } = {}) {
     if (!queue || typeof queue.next !== 'function' || typeof deleteOne !== 'function') throw new Error('删除队列参数无效。');
     const failed = [];
     let succeeded = 0;
@@ -169,6 +170,7 @@
       succeeded += 1;
       processed += 1;
       onProgress?.({ deleted: succeeded, failed: 0, processed, total: null, probing: true });
+      onProbeSuccess?.(first);
     } catch (error) {
       failed.push({ record: first, error: String(error?.message || error) });
       queue.stop();
@@ -820,8 +822,9 @@
   }
 
   function buildTimeDiagnosticNotice(summary) {
-    if (!summary.localDateDistinguishableSampleCount) return '当前 Library 中未找到候选时间字段跨本地日期的文件。由于当前 UI 对旧文件主要显示日期级时间，现有样本不足以确定 UI 修改时间对应字段。';
-    if (summary.localDateDistinguishableSampleCount > summary.renderedLocalDateDistinguishableSampleCount) return `发现 ${summary.localDateDistinguishableSampleCount} 个候选时间字段跨本地日期的文件，但当前页面仅渲染其中 ${summary.renderedLocalDateDistinguishableSampleCount} 个，暂时无法据此确定 UI 修改时间对应字段。`;
+    if ((summary.likelyMatches?.[VERIFIED_UI_MODIFIED_TIME_FIELD] || 0) >= 1 && summary.distinguishableUiSampleCount > 0) return '当前可唯一区分样本与已验证结论一致：Library UI 修改时间匹配 updated_at。';
+    if (!summary.localDateDistinguishableSampleCount) return '当前扫描未找到候选时间字段跨本地日期的自然样本；Library UI 修改时间 = updated_at 已通过可控重命名实验确认，本提示仅说明本轮自然样本缺乏额外区分度。';
+    if (summary.localDateDistinguishableSampleCount > summary.renderedLocalDateDistinguishableSampleCount) return `发现 ${summary.localDateDistinguishableSampleCount} 个候选时间字段跨本地日期的自然样本，其中 ${summary.renderedLocalDateDistinguishableSampleCount} 个当前已渲染；Library UI 修改时间 = updated_at 已通过可控重命名实验确认。`;
     return '';
   }
 
@@ -885,18 +888,64 @@
     return { items: payload.items, cursor: payload.cursor || null };
   }
 
+  function isValidScanCheckpoint(checkpoint, signature = '') {
+    return Boolean(
+      checkpoint && checkpoint.version === 1 && checkpoint.valid === true &&
+      (!signature || checkpoint.signature === signature) &&
+      Array.isArray(checkpoint.directoryQueue) && Array.isArray(checkpoint.visitedStates) &&
+      Array.isArray(checkpoint.queuedDirectories) && Array.isArray(checkpoint.pagesByDirectory) &&
+      Array.isArray(checkpoint.files),
+    );
+  }
+
+  function createScanCheckpoint({ signature = '', seedEventId = 0, directoryQueue = [], visitedStates = new Set(), queuedDirectories = new Set(), pagesByDirectory = new Map(), files = new Map(), pages = 0, requests = 0, processedDirectories = 0, currentDirectoryId = null, currentCursor = null, complete = false } = {}) {
+    return {
+      version: 1,
+      signature,
+      seedEventId,
+      valid: !complete,
+      complete: Boolean(complete),
+      directoryQueue: directoryQueue.map((state) => ({ parentDirectoryId: state.parentDirectoryId ?? null, cursor: state.cursor ?? null })),
+      visitedStates: [...visitedStates],
+      queuedDirectories: [...queuedDirectories],
+      pagesByDirectory: [...pagesByDirectory.entries()],
+      files: [...files.values()].map((record) => cloneJson(record)),
+      pages,
+      requests,
+      processedDirectories,
+      currentDirectoryId: currentDirectoryId ?? null,
+      currentCursor: currentCursor ?? null,
+    };
+  }
+
+  function invalidateScanCheckpoint() {
+    return null;
+  }
+
+  function decideScanDeleteAction({ recordCount = 0, scanComplete = false, checkpointValid = false, datasetMutated = false } = {}) {
+    if (datasetMutated) return 'fresh-streaming-scan-delete';
+    if (scanComplete && Number(recordCount) > 0) return 'delete-existing-complete-scan';
+    if (Number(recordCount) > 0 && checkpointValid && !datasetMutated) return 'resume-scan-then-delete';
+    return 'fresh-streaming-scan-delete';
+  }
+
   async function traverseLibraryTree(fetchPage, options = {}) {
     if (typeof fetchPage !== 'function') throw new Error('缺少 Library nodes 页面请求函数。');
-    const files = new Map();
-    const directoryQueue = [{ parentDirectoryId: null, cursor: null }];
-    const visitedStates = new Set();
-    const queuedDirectories = new Set();
-    const pagesByDirectory = new Map();
+    if (options.checkpoint && !isValidScanCheckpoint(options.checkpoint, options.signature || '')) throw new Error('扫描 checkpoint 无效，已安全停止。');
+    const checkpoint = options.checkpoint || null;
+    const files = new Map((checkpoint?.files || []).map((record) => [record.libraryFileId, cloneJson(record)]));
+    const directoryQueue = (checkpoint?.directoryQueue || [{ parentDirectoryId: null, cursor: null }]).map((state) => ({ parentDirectoryId: state.parentDirectoryId ?? null, cursor: state.cursor ?? null }));
+    const visitedStates = new Set(checkpoint?.visitedStates || []);
+    const queuedDirectories = new Set(checkpoint?.queuedDirectories || []);
+    const pagesByDirectory = new Map(checkpoint?.pagesByDirectory || []);
     const maxPagesPerDirectory = options.maxPagesPerDirectory ?? MAX_PAGES_PER_DIRECTORY;
     const maxDirectories = options.maxDirectories ?? MAX_DIRECTORIES;
     const maxTotalRequests = options.maxTotalRequests ?? MAX_TOTAL_REQUESTS;
-    let pages = 0;
-    let requests = 0;
+    let pages = Number(checkpoint?.pages) || 0;
+    let requests = Number(checkpoint?.requests) || 0;
+    let processedDirectories = Number(checkpoint?.processedDirectories) || 0;
+    let currentDirectoryId = checkpoint?.currentDirectoryId ?? null;
+    let currentCursor = checkpoint?.currentCursor ?? null;
 
     while (directoryQueue.length) {
       if (options.shouldStop?.()) throw new Error('STOP_REQUESTED');
@@ -905,6 +954,8 @@
       const stateKey = `${state.parentDirectoryId || 'ROOT'}::${state.cursor || 'FIRST'}`;
       if (visitedStates.has(stateKey)) throw new Error(`重复的目录分页状态：${stateKey}`);
       visitedStates.add(stateKey);
+      currentDirectoryId = state.parentDirectoryId;
+      currentCursor = state.cursor;
 
       const directoryKey = state.parentDirectoryId || 'ROOT';
       const directoryPages = (pagesByDirectory.get(directoryKey) || 0) + 1;
@@ -928,10 +979,20 @@
       }
       const pageRecords = [...files.values()].filter((record) => parsed.items.some((item) => item?.kind === 'file' && item.id === record.libraryFileId));
       const nextState = { parentDirectoryId: state.parentDirectoryId, cursor: parsed.cursor };
+      if (parsed.cursor === null) processedDirectories += 1;
       options.onPage?.({ parentDirectoryId: state.parentDirectoryId, cursor: state.cursor, nextCursor: parsed.cursor, nextState, records: pageRecords, directoryComplete: parsed.cursor === null, pages, files: files.size, pending: directoryQueue.length });
       if (parsed.cursor !== null) directoryQueue.unshift({ parentDirectoryId: state.parentDirectoryId, cursor: parsed.cursor });
+      options.onCheckpoint?.(createScanCheckpoint({
+        signature: options.signature || '', seedEventId: options.seedEventId || 0, directoryQueue, visitedStates, queuedDirectories, pagesByDirectory, files,
+        pages, requests, processedDirectories, currentDirectoryId, currentCursor: parsed.cursor || state.cursor || null,
+      }));
     }
-    return { files: [...files.values()], pages, requests, directories: queuedDirectories.size, complete: true };
+    const completedCheckpoint = createScanCheckpoint({
+      signature: options.signature || '', seedEventId: options.seedEventId || 0, directoryQueue, visitedStates, queuedDirectories, pagesByDirectory, files,
+      pages, requests, processedDirectories, currentDirectoryId, currentCursor: null, complete: true,
+    });
+    options.onCheckpoint?.(completedCheckpoint);
+    return { files: [...files.values()], pages, requests, directories: queuedDirectories.size, complete: true, checkpoint: completedCheckpoint };
   }
 
   function chooseScanSeed(events) {
@@ -1002,6 +1063,10 @@
     createDeleteQueue,
     runDeleteQueuePipeline,
     runVerificationPasses,
+    isValidScanCheckpoint,
+    createScanCheckpoint,
+    invalidateScanCheckpoint,
+    decideScanDeleteAction,
     traverseLibraryTree,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
@@ -1035,7 +1100,11 @@
       directoryPageCount: 0,
       currentDirectoryId: null,
       currentCursor: null,
+      checkpoint: null,
+      datasetMutated: false,
     },
+    cleanupVerification: null,
+    deleteQueue: null,
   };
 
   function nowIso() { return new Date().toISOString(); }
@@ -1401,16 +1470,30 @@
           state.scan.currentCursor = nextCursor || cursor || null;
           state.scan.pendingDirectories = pending;
           state.scan.directoryPageCount = pages;
-          if (directoryComplete) state.scan.processedDirectories += 1;
           for (const record of records || []) {
             state.scan.records.set(record.libraryFileId, record);
           }
           options.onPage?.({ parentDirectoryId, cursor, nextCursor, records: records || [], directoryComplete });
           updateUi();
         },
+        onCheckpoint: (checkpoint) => {
+          if (!state.scan.datasetMutated || options.allowCheckpointAfterMutation) state.scan.checkpoint = checkpoint.valid ? checkpoint : null;
+          state.scan.pageCount = checkpoint.pages;
+          state.scan.requestCount = checkpoint.requests;
+          state.scan.processedDirectories = checkpoint.processedDirectories;
+          state.scan.pendingDirectories = checkpoint.directoryQueue.length;
+          state.scan.currentDirectoryId = checkpoint.currentDirectoryId;
+          state.scan.currentCursor = checkpoint.currentCursor;
+          state.scan.directoryPageCount = checkpoint.pages;
+          updateUi();
+        },
+        checkpoint: options.checkpoint,
+        signature: state.scan.signature,
+        seedEventId: state.scan.seedEventId,
       },
     );
     for (const record of result.files) state.scan.records.set(record.libraryFileId, record);
+    if (!state.scan.datasetMutated || options.allowCheckpointAfterMutation) state.scan.checkpoint = result.checkpoint?.valid ? result.checkpoint : null;
     return result.complete;
   }
 
@@ -1510,10 +1593,46 @@
     return false;
   }
 
+  function resetScanPass(seed, { clearRecords = true, mode = '扫描中' } = {}) {
+    if (clearRecords) state.scan.records = new Map();
+    state.scan.complete = false;
+    state.scan.mode = mode;
+    state.scan.warning = '';
+    state.scan.signature = seed?.signature || '';
+    state.scan.seedEventId = seed?.id || 0;
+    state.scan.rule = null;
+    state.scan.pageCount = 0;
+    state.scan.requestCount = 0;
+    state.scan.processedDirectories = 0;
+    state.scan.pendingDirectories = 0;
+    state.scan.directoryPageCount = 0;
+    state.scan.currentDirectoryId = null;
+    state.scan.currentCursor = null;
+    state.scan.checkpoint = null;
+    state.scan.datasetMutated = false;
+    state.cleanupVerification = null;
+  }
+
+  function markDatasetMutated() {
+    state.scan.checkpoint = invalidateScanCheckpoint();
+    state.scan.datasetMutated = true;
+    state.scan.complete = false;
+    state.scan.warning = 'Library 已发生删除操作，之前的扫描断点已失效；如需继续扫描，必须从 ROOT 重新开始。';
+  }
+
+  function isCurrentCheckpointResumable(seed) {
+    return isValidScanCheckpoint(state.scan.checkpoint, seed?.signature || state.scan.signature) && !state.scan.datasetMutated;
+  }
+
   async function autoScanAll() {
     if (state.scanning || state.deleting) return;
     if (!isLibraryPage()) {
       root.alert('请先打开 ChatGPT 的 Library 页面。');
+      return;
+    }
+
+    if (state.scan.complete) {
+      root.alert('当前 Library 已完成完整扫描，无需重复扫描。');
       return;
     }
 
@@ -1523,29 +1642,24 @@
       return;
     }
 
+    const resume = isCurrentCheckpointResumable(seed);
     state.stopRequested = false;
     state.scanning = true;
-    state.scan.records = new Map();
-    state.scan.complete = false;
-    state.scan.mode = '自动滚动学习分页';
-    state.scan.warning = '';
-    state.scan.signature = seed.signature;
-    state.scan.seedEventId = seed.id;
-    state.scan.rule = null;
-    state.scan.pageCount = 1;
-    state.scan.requestCount = 0;
-    state.scan.processedDirectories = 0;
-    state.scan.pendingDirectories = 0;
-    state.scan.directoryPageCount = 0;
-    state.scan.currentDirectoryId = null;
-    state.scan.currentCursor = null;
-    for (const event of scanEvents()) integrateEventRecords(event);
-    state.scan.pageCount = Math.max(1, scanEvents().length);
+    if (resume) {
+      state.scan.mode = '继续扫描：后台直读目录树 + cursor 分页';
+      state.scan.warning = '';
+      state.scan.signature = seed.signature;
+      state.scan.seedEventId = seed.id;
+    } else {
+      resetScanPass(seed, { mode: '自动滚动学习分页' });
+      for (const event of scanEvents()) integrateEventRecords(event);
+      state.scan.pageCount = Math.max(1, scanEvents().length);
+    }
     updateUi();
 
     try {
       if (isLibraryNodesUrl(seed.request.url)) {
-        const complete = await directLibraryTreeScan(seed);
+        const complete = await directLibraryTreeScan(seed, { checkpoint: resume ? state.scan.checkpoint : null });
         if (complete) {
           state.scan.complete = true;
           state.scan.mode = '后台直读目录树完成';
@@ -1644,7 +1758,7 @@
     throw lastError || new Error('未知删除错误');
   }
 
-  async function deleteRecordsConcurrently(records, concurrency, onProgress) {
+  async function deleteRecordsConcurrently(records, concurrency, onProgress, onDeleted) {
     let cursor = 0;
     let deleted = 0;
     const failed = [];
@@ -1658,6 +1772,7 @@
         try {
           await deleteOne(record);
           deleted += 1;
+          onDeleted?.(record);
         } catch (error) {
           if (error?.message === 'STOP_REQUESTED') return;
           failed.push({ record, error: String(error?.message || error) });
@@ -1671,151 +1786,50 @@
     return { deleted, failed, stopped: state.stopRequested };
   }
 
-  async function startDelete() {
-    if (state.scanning || state.deleting) return;
-    if (!isLibraryPage()) { root.alert('请先打开 ChatGPT 的 Library 页面。'); return; }
-    const seed = latestListEvent();
-    if (!seed || !isLibraryNodesUrl(seed.request.url)) {
-      root.alert('尚未捕获到可安全直读的 Library nodes 首屏请求，请刷新 Library 页面后重试。');
-      return;
-    }
-    const dateText = String(root.document.getElementById('cgpt-lib-tool-cutoff')?.value || DEFAULT_CUTOFF).trim();
-    const concurrency = Number(root.document.getElementById('cgpt-lib-tool-concurrency')?.value || DEFAULT_CONCURRENCY);
-    let cutoffMs;
-    try { cutoffMs = localCutoffMs(dateText); } catch (error) { root.alert(error.message); return; }
-    if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
-      root.alert(`并发数必须是 1～${MAX_CONCURRENCY} 的整数。`); return;
-    }
-
-    state.stopRequested = false;
-    state.scanning = true;
-    state.deleting = false;
-    state.scan.records = new Map();
-    state.scan.complete = false;
-    state.scan.warning = '';
-    state.scan.mode = '扫描中：目录树生产者 + 删除队列';
-    state.scan.signature = seed.signature;
-    state.scan.seedEventId = seed.id;
-    state.scan.pageCount = 0;
-    state.scan.requestCount = 0;
-    state.scan.processedDirectories = 0;
-    state.scan.pendingDirectories = 0;
-    state.scan.currentDirectoryId = null;
-    state.scan.currentCursor = null;
-    const queue = createDeleteQueue({ cutoffMs });
-    state.deleteQueue = queue;
-    updateUi();
-
-    const scanPromise = directLibraryTreeScan(seed, { onPage: ({ records }) => queue.enqueue(records) })
-      .then((complete) => {
-        if (complete) {
-          state.scan.complete = true;
-          state.scan.mode = '后台直读目录树完成（删除队列已关闭）';
-        }
-        return complete;
-      })
-      .finally(() => queue.close());
-    try {
-      const first = await queue.waitForItem();
-      const firstWaitScanResult = first ? null : await scanPromise;
-      if (!first) {
-        if (firstWaitScanResult) root.alert(`扫描完整，但没有发现创建日期在 ${dateText} 当天及以前的可删除本地文件。`);
-        return;
-      }
-      state.deleting = true;
-      state.deleteStartedAt = Date.now();
-      updateUi();
-      const deletePromise = runDeleteQueuePipeline({
-        queue, concurrency, shouldStop: () => state.stopRequested,
-        deleteOne,
-        confirmAfterProbe: state.deleteSchemaVerifiedForSession ? undefined : async (record) => {
-          const confirmed = root.confirm(
-            `首个 soft-delete 请求已成功返回。\n\n` +
-            `测试文件：\n文件名：${record.name || '[未知]'}\nLibrary ID：${record.libraryFileId}\n\n` +
-            `请确认该文件已经从 ChatGPT Library 主列表中消失。\n\n` +
-            `是否继续批量删除？`,
-          );
-          if (confirmed) {
-            state.deleteSchemaVerifiedForSession = true;
-            return true;
-          }
-          state.stopRequested = true;
-          return false;
-        },
-        onProgress: ({ deleted, failed }) => { state.deleteSucceeded = deleted; state.deleteFailed = failed; updateUi(); },
-      });
-      const scanResult = await scanPromise;
-      const result = await deletePromise;
-      if (result.failed.length) console.error('[ChatGPT Library 工具] 删除失败：', result.failed);
-      if (!scanResult || !result.probeSucceeded || result.failed.length || result.remaining) {
-        root.alert(`流式清理结束，但未通过安全验证。\n\n成功：${result.deleted}\n失败：${result.failed.length}\n未处理：${result.remaining}`);
-        return;
-      }
-      const deletedIds = new Set(queue.snapshot().deleted);
-      const verification = await runVerificationPasses({
-        scan: async () => {
-          if (state.stopRequested) return { complete: false, targets: [] };
-          const freshSeed = await fetchLibraryNodes(buildLibraryNodesUrl(null, null), seed);
-          state.scan.records = new Map();
-          const complete = await directLibraryTreeScan(freshSeed);
-          return { complete, targets: selectDeletionTargets([...state.scan.records.values()], cutoffMs).targets };
-        },
-        deleteTargets: async (targets) => {
-          const verificationQueue = createDeleteQueue({ cutoffMs });
-          verificationQueue.enqueue(targets);
-          verificationQueue.close();
-          state.deleteQueue = verificationQueue;
+  async function runFullCleanupVerification(seed, cutoffMs, concurrency, deletedIds) {
+    const verification = await runVerificationPasses({
+      scan: async () => {
+        if (state.stopRequested) return { complete: false, targets: [] };
+        const freshSeed = await fetchLibraryNodes(buildLibraryNodesUrl(null, null), seed);
+        resetScanPass(freshSeed, { mode: 'verification：从 ROOT 重新扫描' });
+        state.scanning = true;
+        const complete = await directLibraryTreeScan(freshSeed);
+        state.scan.complete = complete;
+        return { complete, targets: complete ? selectDeletionTargets([...state.scan.records.values()], cutoffMs).targets : [] };
+      },
+      deleteTargets: async (targets) => {
+        const verificationQueue = createDeleteQueue({ cutoffMs });
+        verificationQueue.enqueue(targets);
+        verificationQueue.close();
+        state.deleteQueue = verificationQueue;
+        try {
           const verificationDelete = await runDeleteQueuePipeline({
             queue: verificationQueue, concurrency, shouldStop: () => state.stopRequested,
-            deleteOne, onProgress: ({ deleted, failed }) => { state.deleteSucceeded = deleted; state.deleteFailed = failed; updateUi(); },
+            deleteOne,
+            onProbeSuccess: markDatasetMutated,
+            onProgress: ({ deleted, failed }) => { state.deleteSucceeded = deleted; state.deleteFailed = failed; updateUi(); },
           });
-          return { deletedIds: verificationQueue.snapshot().deleted, failed: verificationDelete.failed };
-        },
-        deletedIds,
-      });
-      if (verification.complete) {
-        root.alert('清理验证完成：未发现遗漏旧文件。');
-      } else {
-        root.alert(`清理验证未完成。\n\n剩余目标：${verification.remaining.length}\n已达到最多 ${MAX_VERIFY_PASSES} 轮或本轮扫描/删除不完整。`);
-      }
-    } catch (error) {
-      if (error?.message === 'STOP_REQUESTED') root.alert('扫描/删除已停止。');
-      else { state.scan.warning = `流式扫描失败：${error?.message || error}`; root.alert(state.scan.warning); }
-    } finally {
-      queue.close();
-      state.scanning = false;
-      state.deleting = false;
-      updateUi();
-    }
+          const failed = [...verificationDelete.failed];
+          if (!verificationDelete.probeSucceeded && !failed.length) failed.push({ error: 'verification delete stopped' });
+          return { deletedIds: verificationQueue.snapshot().deleted, failed };
+        } finally {
+          if (state.deleteQueue === verificationQueue) state.deleteQueue = null;
+        }
+      },
+      deletedIds,
+    });
+    return verification;
   }
 
-  async function startDeleteScannedRecords() {
-    if (state.scanning || state.deleting) return;
-    if (!canDeleteScannedRecords({ scanning: state.scanning, deleting: state.deleting, recordCount: state.scan.records.size })) {
-      root.alert('当前没有可删除的已扫描记录，或扫描/删除任务仍在运行。');
-      return;
-    }
-
-    const dateInput = root.document.getElementById('cgpt-lib-tool-cutoff');
-    const concurrencyInput = root.document.getElementById('cgpt-lib-tool-concurrency');
-    const dateText = String(dateInput?.value || DEFAULT_CUTOFF).trim();
-    const concurrency = Number(concurrencyInput?.value || DEFAULT_CONCURRENCY);
-    let cutoffMs;
-    try { cutoffMs = inclusiveCutoffExclusiveEndMs(dateText); }
-    catch (error) { root.alert(error.message); return; }
-    if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
-      root.alert(`并发数必须是 1～${MAX_CONCURRENCY} 的整数。`);
-      return;
-    }
-
-    const records = [...state.scan.records.values()];
+  async function deleteExistingTargets({ records, cutoffMs, dateText, concurrency, verifyAfterDelete, seed } = {}) {
+    const completeScan = Boolean(state.scan.complete);
     const selection = selectDeletionTargets(records, cutoffMs);
     const targets = selection.targets;
     if (!targets.length) {
-      root.alert(state.scan.complete
-        ? `完整扫描后，没有发现创建日期在 ${dateText} 当天及以前的可删除本地 Library 文件。`
-        : `当前已扫描范围内没有发现创建日期在 ${dateText} 当天及以前的可删除本地 Library 文件。未扫描部分不会处理。`);
-      return;
+      root.alert(completeScan
+        ? `完整扫描后，没有发现 Library 修改时间在 ${dateText} 当天及以前的可删除本地文件。`
+        : `当前已扫描范围内没有发现 Library 修改时间在 ${dateText} 当天及以前的可删除本地文件。未扫描部分不会处理。`);
+      return { started: false, deleted: 0, failed: [] };
     }
     const invalidTarget = targets.map((record, index) => ({ record, index, validation: validateDeletionTarget(record) }))
       .find((entry) => !entry.validation.valid);
@@ -1830,66 +1844,225 @@
         reasons: validation.reasons,
       });
       root.alert('删除前一致性检查失败：存在身份、日期或来源无法确认的目标，已阻止整批删除。');
-      return;
+      return { started: false, deleted: 0, failed: [] };
     }
     const bytes = targets.reduce((sum, record) => sum + (Number(record.sizeBytes) || 0), 0);
     const confirmed = root.confirm(
       `ChatGPT Library 高速清理\n\n` +
-      (state.scan.complete ? `完整扫描：${records.length} 个 Library 文件记录\n` : `当前扫描未完整。\n本次仅删除已经扫描到的 ${records.length} 个记录中的 ${targets.length} 个符合条件文件。\n未扫描部分不会处理。\n`) +
+      (completeScan ? `完整扫描：${records.length} 个 Library 文件记录\n` : `当前扫描未完整。\n本次仅删除已经扫描到的 ${records.length} 个记录中的 ${targets.length} 个符合条件文件。\n未扫描部分不会处理。\n`) +
       `将删除：${targets.length} 个\n` +
       `日期未知（保留）：${selection.unknownDateCount} 个\n` +
       `外部/Google Drive（保留）：${selection.externalCount} 个\n` +
       `估算体积：${formatBytes(bytes)}\n` +
-      `规则：删除创建日期在 ${dateText} 当天及以前的文件；${dateText} 次日及以后保留。\n` +
+      `规则：删除 Library 修改时间在 ${dateText} 当天及以前的文件；${dateText} 次日及以后保留。\n` +
       `并发：${concurrency}\n\n` +
       '使用 soft delete，文件会先进入 Recently deleted。\n\n确定开始吗？',
     );
-    if (!confirmed) return;
+    if (!confirmed) return { started: false, deleted: 0, failed: [] };
 
+    state.cleanupVerification = null;
     state.deleting = true;
     state.stopRequested = false;
+    state.deleteSucceeded = 0;
+    state.deleteFailed = 0;
+    const deletedIds = new Set();
     updateUi();
     try {
-      // 先用最旧的 1 个文件探测删除接口；成功后再放开高并发。
       await deleteOne(targets[0]);
+      deletedIds.add(targets[0].libraryFileId);
+      markDatasetMutated();
       let deleted = 1;
       updateDeleteProgress(deleted, 0, targets.length);
       if (!state.deleteSchemaVerifiedForSession) {
         const verified = root.confirm(
           `首个 soft-delete 请求已成功返回。\n\n测试文件：\n文件名：${targets[0].name || '[未知]'}\nLibrary ID：${targets[0].libraryFileId}\n\n请确认该文件已经从 ChatGPT Library 主列表中消失。\n\n是否继续批量删除？`,
         );
-        if (!verified) { state.stopRequested = true; return; }
+        if (!verified) { state.stopRequested = true; return { started: true, deleted, failed: [] }; }
         state.deleteSchemaVerifiedForSession = true;
       }
-      if (state.stopRequested || targets.length === 1) {
-        root.alert(`已停止/完成探测删除：成功 ${deleted} 个。`);
-        return;
-      }
+      if (state.stopRequested) return { started: true, deleted, failed: [] };
 
-      const result = await deleteRecordsConcurrently(targets.slice(1), concurrency, ({ deleted: restDeleted, failed, total }) => {
-        updateDeleteProgress(1 + restDeleted, failed, 1 + total);
-      });
+      const result = targets.length > 1
+        ? await deleteRecordsConcurrently(targets.slice(1), concurrency, ({ deleted: restDeleted, failed, total }) => updateDeleteProgress(1 + restDeleted, failed, 1 + total), (record) => { deletedIds.add(record.libraryFileId); })
+        : { deleted: 0, failed: [], stopped: false };
       deleted += result.deleted;
-
-      if (result.stopped) {
-        root.alert(`已停止。\n\n成功删除：${deleted}\n失败：${result.failed.length}\n未处理：${Math.max(0, targets.length - deleted - result.failed.length)}`);
-      } else if (result.failed.length) {
-        console.error('[ChatGPT Library 工具] 删除失败：', result.failed);
-        root.alert(`本轮结束。\n\n成功删除：${deleted}\n失败：${result.failed.length}\n\n失败详情已输出到控制台。`);
-      } else {
-        root.alert(state.scan.complete
-          ? `已删除当前已扫描范围内的目标文件。\n\n成功软删除：${deleted} 个。`
-          : `已删除当前已扫描范围内的目标文件。\n\n成功软删除：${deleted} 个。未扫描部分未处理。`);
+      if (result.stopped || result.failed.length) {
+        if (result.failed.length) console.error('[ChatGPT Library 工具] 删除失败：', result.failed);
+        root.alert(result.stopped
+          ? `已停止。\n\n成功删除：${deleted}\n失败：${result.failed.length}\n未处理：${Math.max(0, targets.length - deleted - result.failed.length)}`
+          : `本轮结束。\n\n成功删除：${deleted}\n失败：${result.failed.length}\n\n失败详情已输出到控制台。`);
+        return { started: true, deleted, failed: result.failed };
       }
-      state.scan.complete = false;
-      state.scan.warning = '删除后列表已变化，请刷新页面并重新扫描。';
+
+      if (!verifyAfterDelete) {
+        root.alert(`已删除当前已扫描范围内的目标文件。\n\n成功软删除：${deleted} 个。${completeScan ? '' : '未扫描部分未处理。'}`);
+        return { started: true, deleted, failed: [] };
+      }
+
+      const verification = await runFullCleanupVerification(seed, cutoffMs, concurrency, deletedIds);
+      if (verification.complete) {
+        state.cleanupVerification = { complete: true, cutoffDate: dateText, verifiedAt: nowIso() };
+        state.scan.complete = true;
+        state.scan.warning = '';
+        root.alert('清理验证完成：未发现遗漏旧文件。');
+      } else {
+        state.cleanupVerification = null;
+        root.alert(`清理验证未完成。\n\n剩余目标：${verification.remaining.length}\n已达到最多 ${MAX_VERIFY_PASSES} 轮或本轮扫描/删除不完整。`);
+      }
+      return { started: true, deleted, failed: [] };
     } catch (error) {
-      if (error?.message === 'STOP_REQUESTED') root.alert('删除已停止。');
-      else root.alert(`删除探测/执行失败：${error?.message || error}\n\n已停止后续批量删除，没有继续硬冲。`);
+      if (error?.message === 'STOP_REQUESTED') root.alert('扫描/删除已停止。');
+      else { state.scan.warning = `删除探测/执行失败：${error?.message || error}`; root.alert(`${state.scan.warning}\n\n已停止后续批量删除，没有继续硬冲。`); }
+      return { started: true, deleted: 0, failed: [{ error: String(error?.message || error) }] };
     } finally {
+      state.deleteQueue = null;
       state.deleting = false;
       updateUi();
     }
+  }
+
+  async function startDelete() {
+    if (state.scanning || state.deleting) return;
+    if (!isLibraryPage()) { root.alert('请先打开 ChatGPT 的 Library 页面。'); return; }
+    const dateText = String(root.document.getElementById('cgpt-lib-tool-cutoff')?.value || DEFAULT_CUTOFF).trim();
+    const concurrency = Number(root.document.getElementById('cgpt-lib-tool-concurrency')?.value || DEFAULT_CONCURRENCY);
+    let cutoffMs;
+    try { cutoffMs = localCutoffMs(dateText); } catch (error) { root.alert(error.message); return; }
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
+      root.alert(`并发数必须是 1～${MAX_CONCURRENCY} 的整数。`); return;
+    }
+    const seed = latestListEvent();
+    if (!seed || !isLibraryNodesUrl(seed.request.url)) {
+      root.alert('尚未捕获到可安全直读的 Library nodes 首屏请求，请刷新 Library 页面后重试。');
+      return;
+    }
+    const action = decideScanDeleteAction({
+      recordCount: state.scan.records.size,
+      scanComplete: state.scan.complete,
+      checkpointValid: isCurrentCheckpointResumable(seed),
+      datasetMutated: state.scan.datasetMutated,
+    });
+    if (action === 'delete-existing-complete-scan') {
+      state.cleanupVerification = null;
+      await deleteExistingTargets({ records: [...state.scan.records.values()], cutoffMs, dateText, concurrency, verifyAfterDelete: true, seed });
+      return;
+    }
+    if (action === 'resume-scan-then-delete') {
+      const checkpoint = state.scan.checkpoint;
+      state.stopRequested = false;
+      state.scanning = true;
+      state.scan.warning = '';
+      state.cleanupVerification = null;
+      updateUi();
+      try {
+        const complete = await directLibraryTreeScan(seed, { checkpoint });
+        if (!complete) {
+          root.alert('续扫未能确认到达 Library 末尾，已停止删除。');
+          return;
+        }
+        state.scan.complete = true;
+        state.scan.mode = '后台直读目录树完成';
+        state.scanning = false;
+        await deleteExistingTargets({ records: [...state.scan.records.values()], cutoffMs, dateText, concurrency, verifyAfterDelete: true, seed });
+      } catch (error) {
+        if (error?.message === 'STOP_REQUESTED') state.scan.warning = '扫描已由用户停止。';
+        else state.scan.warning = `续扫失败：${error?.message || error}`;
+        root.alert(state.scan.warning);
+      } finally {
+        state.scanning = false;
+        updateUi();
+      }
+      return;
+    }
+
+    state.stopRequested = false;
+    state.scanning = true;
+    state.deleting = false;
+    resetScanPass(seed, { mode: '扫描中：目录树生产者 + 删除队列' });
+    const queue = createDeleteQueue({ cutoffMs });
+    state.deleteQueue = queue;
+    updateUi();
+    const scanPromise = directLibraryTreeScan(seed, { onPage: ({ records }) => queue.enqueue(records) })
+      .then((complete) => {
+        if (complete) {
+          state.scan.complete = true;
+          state.scan.mode = '后台直读目录树完成（删除队列已关闭）';
+        }
+        return complete;
+      })
+      .finally(() => queue.close());
+    try {
+      const first = await queue.waitForItem();
+      const firstWaitScanResult = first ? null : await scanPromise;
+      if (!first) {
+        if (firstWaitScanResult) root.alert(`扫描完整，但没有发现 Library 修改时间在 ${dateText} 当天及以前的可删除本地文件。`);
+        return;
+      }
+      state.deleting = true;
+      state.deleteStartedAt = Date.now();
+      updateUi();
+      const result = await runDeleteQueuePipeline({
+        queue, concurrency, shouldStop: () => state.stopRequested,
+        deleteOne,
+        onProbeSuccess: markDatasetMutated,
+        confirmAfterProbe: state.deleteSchemaVerifiedForSession ? undefined : async (record) => {
+          const confirmed = root.confirm(`首个 soft-delete 请求已成功返回。\n\n测试文件：\n文件名：${record.name || '[未知]'}\nLibrary ID：${record.libraryFileId}\n\n请确认该文件已经从 ChatGPT Library 主列表中消失。\n\n是否继续批量删除？`);
+          if (confirmed) { state.deleteSchemaVerifiedForSession = true; return true; }
+          state.stopRequested = true;
+          return false;
+        },
+        onProgress: ({ deleted, failed }) => { state.deleteSucceeded = deleted; state.deleteFailed = failed; updateUi(); },
+      });
+      const scanResult = await scanPromise;
+      if (result.failed.length) console.error('[ChatGPT Library 工具] 删除失败：', result.failed);
+      if (!scanResult || !result.probeSucceeded || result.failed.length || result.remaining) {
+        root.alert(`流式清理结束，但未通过安全验证。\n\n成功：${result.deleted}\n失败：${result.failed.length}\n未处理：${result.remaining}`);
+        return;
+      }
+      const verification = await runFullCleanupVerification(seed, cutoffMs, concurrency, new Set(queue.snapshot().deleted));
+      if (verification.complete) {
+        state.cleanupVerification = { complete: true, cutoffDate: dateText, verifiedAt: nowIso() };
+        state.scan.complete = true;
+        state.scan.warning = '';
+        root.alert('清理验证完成：未发现遗漏旧文件。');
+      } else {
+        state.cleanupVerification = null;
+        root.alert(`清理验证未完成。\n\n剩余目标：${verification.remaining.length}\n已达到最多 ${MAX_VERIFY_PASSES} 轮或本轮扫描/删除不完整。`);
+      }
+    } catch (error) {
+      if (error?.message === 'STOP_REQUESTED') root.alert('扫描/删除已停止。');
+      else { state.scan.warning = `流式扫描失败：${error?.message || error}`; root.alert(state.scan.warning); }
+    } finally {
+      queue.close();
+      state.deleteQueue = null;
+      state.scanning = false;
+      state.deleting = false;
+      updateUi();
+    }
+  }
+
+  async function startDeleteScannedRecords() {
+    if (state.scanning || state.deleting) return;
+    if (!canDeleteScannedRecords({ scanning: state.scanning, deleting: state.deleting, recordCount: state.scan.records.size })) {
+      root.alert('当前没有可删除的已扫描记录，或扫描/删除任务仍在运行。');
+      return;
+    }
+    state.cleanupVerification = null;
+
+    const dateInput = root.document.getElementById('cgpt-lib-tool-cutoff');
+    const concurrencyInput = root.document.getElementById('cgpt-lib-tool-concurrency');
+    const dateText = String(dateInput?.value || DEFAULT_CUTOFF).trim();
+    const concurrency = Number(concurrencyInput?.value || DEFAULT_CONCURRENCY);
+    let cutoffMs;
+    try { cutoffMs = inclusiveCutoffExclusiveEndMs(dateText); }
+    catch (error) { root.alert(error.message); return; }
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
+      root.alert(`并发数必须是 1～${MAX_CONCURRENCY} 的整数。`);
+      return;
+    }
+    await deleteExistingTargets({
+      records: [...state.scan.records.values()], cutoffMs, dateText, concurrency, verifyAfterDelete: false, seed: null,
+    });
   }
 
   function stopCurrent() {
@@ -2015,6 +2188,7 @@
     const requests = root.document.getElementById('cgpt-lib-tool-requests');
     const cursor = root.document.getElementById('cgpt-lib-tool-cursor');
     const targetPreview = root.document.getElementById('cgpt-lib-tool-target-preview');
+    const deleteVerified = root.document.getElementById('cgpt-lib-tool-delete-verified');
     const status = root.document.getElementById('cgpt-lib-tool-status');
     const scanBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="scan"]');
     const deleteBtn = root.document.querySelector('#cgpt-lib-tool-panel [data-act="delete"]');
@@ -2038,7 +2212,7 @@
     if (targetPreview) {
       let preview = '将删除：待扫描发现';
       const cutoff = root.document.getElementById('cgpt-lib-tool-cutoff')?.value;
-      if (state.deleteQueue) {
+      if ((state.scanning || state.deleting) && state.deleteQueue) {
         preview = `将删除：${state.deleteQueue.snapshot().queuedCount} 个文件（队列中/已发现）`;
       } else if (state.scan.records.size > 0 && cutoff) {
         try { preview = `将删除：${selectDeletionTargets([...state.scan.records.values()], inclusiveCutoffExclusiveEndMs(cutoff)).targets.length} 个文件（已扫描范围）`; }
@@ -2046,11 +2220,13 @@
       }
       targetPreview.textContent = preview;
     }
+    if (deleteVerified) deleteVerified.textContent = state.deleteSchemaVerifiedForSession ? '删除接口：当前页面 session 已通过单文件验证' : '删除接口：未进行真实单文件验证';
     if (status) {
       if (state.stopRequested && (state.scanning || state.deleting)) status.innerHTML = '<b>正在停止…</b>';
       else if (state.scanning && state.deleting) status.innerHTML = `<b>扫描 + 删除中</b>：已发现 ${state.scan.records.size} 个，成功 ${state.deleteSucceeded || 0}，失败 ${state.deleteFailed || 0}`;
       else if (state.scanning) status.innerHTML = `<b>扫描中</b>：${state.scan.records.size} 个，网络请求中 ${state.inflight}`;
       else if (state.deleting) status.innerHTML = '<b>删除中</b>：可随时点“停止”';
+      else if (state.cleanupVerification && state.cleanupVerification.cutoffDate === root.document.getElementById('cgpt-lib-tool-cutoff')?.value) status.innerHTML = '<b>清理验证完成</b>：当前未发现符合截止日期的旧文件。';
       else if (state.scan.complete) status.innerHTML = `<b>扫描完整</b>：可以执行删除${state.scan.warning ? `；${state.scan.warning}` : ''}`;
       else if (state.scan.warning) status.textContent = state.scan.warning;
       else status.textContent = '等待操作。首次安装后建议刷新一次 Library 页面。';
@@ -2106,7 +2282,7 @@
         <div>总请求：<b id="cgpt-lib-tool-requests">0</b></div>
         <div>当前 cursor：<b id="cgpt-lib-tool-cursor">null</b></div>
         <div style="grid-column:1 / 3;color:#fbbf24" id="cgpt-lib-tool-target-preview">将删除：待完整扫描</div>
-        <div style="grid-column:1 / 3;color:#fbbf24">删除接口：未进行真实单文件验证</div>
+        <div style="grid-column:1 / 3;color:#fbbf24" id="cgpt-lib-tool-delete-verified">删除接口：未进行真实单文件验证</div>
       </div>
       <div id="cgpt-lib-tool-status" style="padding:8px 9px;background:#1f2937;border-radius:8px;margin-bottom:10px">等待操作。</div>
       <pre id="cgpt-lib-tool-time-diagnostic" style="display:none;max-height:260px;overflow:auto;white-space:pre-wrap;background:#0b1220;padding:8px;border-radius:8px;font-size:11px"></pre>
@@ -2137,6 +2313,11 @@
     for (const input of panel.querySelectorAll('input')) {
       Object.assign(input.style, { background: '#0b1220', color: '#fff', border: '1px solid #374151', borderRadius: '6px', padding: '4px 6px' });
     }
+
+    panel.querySelector('#cgpt-lib-tool-cutoff')?.addEventListener('change', () => {
+      state.cleanupVerification = null;
+      updateUi();
+    });
 
     button.addEventListener('click', () => { panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; updateUi(); });
     panel.addEventListener('click', async (event) => {

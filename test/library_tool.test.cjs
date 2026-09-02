@@ -423,7 +423,17 @@ test('diagnostic summary reports local-date evidence and evidence insufficiency'
   ]);
   assert.equal(summary.localDateDistinguishableSampleCount, 1);
   assert.equal(summary.renderedLocalDateDistinguishableSampleCount, 0);
-  assert.match(tool.buildTimeDiagnosticNotice({ ...summary, localDateDistinguishableSampleCount: 0 }), /未找到候选时间字段跨本地日期/);
+  const notice = tool.buildTimeDiagnosticNotice({ ...summary, localDateDistinguishableSampleCount: 0 });
+  assert.match(notice, /未找到候选时间字段跨本地日期/);
+  assert.doesNotMatch(notice, /不足以确定 UI 修改时间对应字段/);
+});
+
+test('verified updated_at notice is explicit when a unique rendered sample matches', () => {
+  const summary = tool.summarizeTimeDiagnostics([{
+    highInformation: true, localDateDistinguishable: false, reason: null,
+    uiModifiedTimeText: '22:31', uiLikelyMatches: [{ key: 'updated_at', path: 'updated_at' }],
+  }]);
+  assert.match(tool.buildTimeDiagnosticNotice(summary), /已验证结论一致.*updated_at/);
 });
 
 test('time diagnostic export contains no sensitive fields', () => {
@@ -498,6 +508,86 @@ test('diagnostic-only modified and processed fields are not deletion fallbacks',
   assert.equal(tool.selectDeletionTargets([record], tool.inclusiveCutoffExclusiveEndMs('2026-08-01')).targets.length, 0);
 });
 
+test('stopped traversal saves the complete pending frontier and resumes without duplicate states', async () => {
+  const pages = new Map([
+    ['ROOT::FIRST', { items: [file('root-a', null), { kind: 'directory', id: 'libdir_a' }], cursor: 'root-c1' }],
+    ['ROOT::root-c1', { items: [file('root-b', null), { kind: 'directory', id: 'libdir_b' }], cursor: null }],
+    ['libdir_a::FIRST', { items: [file('a-1', 'libdir_a')], cursor: 'a-c1' }],
+    ['libdir_a::a-c1', { items: [file('a-2', 'libdir_a')], cursor: null }],
+    ['libdir_b::FIRST', { items: [file('b-1', 'libdir_b')], cursor: null }],
+  ]);
+  const firstCalls = [];
+  let firstCheckpoint = null;
+  let stop = false;
+  await assert.rejects(tool.traverseLibraryTree(async (parent, cursor) => {
+    const key = `${parent || 'ROOT'}::${cursor || 'FIRST'}`;
+    firstCalls.push(key);
+    return pages.get(key);
+  }, {
+    shouldStop: () => stop,
+    onPage: ({ pages: pageCount }) => { if (pageCount === 2) stop = true; },
+    onCheckpoint: (checkpoint) => { firstCheckpoint = checkpoint; },
+    signature: 'GET /backend-api/files/library/nodes', seedEventId: 7,
+  }), /STOP_REQUESTED/);
+
+  assert.deepEqual(firstCalls, ['ROOT::FIRST', 'ROOT::root-c1']);
+  assert.ok(firstCheckpoint);
+  assert.deepEqual(firstCheckpoint.directoryQueue, [
+    { parentDirectoryId: 'libdir_a', cursor: null },
+    { parentDirectoryId: 'libdir_b', cursor: null },
+  ]);
+  assert.deepEqual(firstCheckpoint.visitedStates, ['ROOT::FIRST', 'ROOT::root-c1']);
+  assert.equal(firstCheckpoint.signature, 'GET /backend-api/files/library/nodes');
+  assert.equal(firstCheckpoint.seedEventId, 7);
+
+  const resumedCalls = [];
+  const resumed = await tool.traverseLibraryTree(async (parent, cursor) => {
+    const key = `${parent || 'ROOT'}::${cursor || 'FIRST'}`;
+    resumedCalls.push(key);
+    return pages.get(key);
+  }, { checkpoint: firstCheckpoint, signature: 'GET /backend-api/files/library/nodes', onCheckpoint: (checkpoint) => { firstCheckpoint = checkpoint; } });
+
+  assert.deepEqual(resumedCalls, ['libdir_a::FIRST', 'libdir_a::a-c1', 'libdir_b::FIRST']);
+  assert.deepEqual(resumed.files.map((record) => record.libraryFileId).sort(), [
+    'libfile_a-1', 'libfile_a-2', 'libfile_b-1', 'libfile_root-a', 'libfile_root-b',
+  ].sort());
+  assert.equal(resumed.complete, true);
+  assert.equal(firstCheckpoint.valid, false);
+});
+
+test('resumed traversal produces the same file set as a fresh complete traversal', async () => {
+  const pages = new Map([
+    ['ROOT::FIRST', { items: [file('root', null), { kind: 'directory', id: 'libdir_a' }], cursor: 'r2' }],
+    ['ROOT::r2', { items: [{ kind: 'directory', id: 'libdir_b' }], cursor: null }],
+    ['libdir_a::FIRST', { items: [file('a', 'libdir_a')], cursor: 'a2' }],
+    ['libdir_a::a2', { items: [file('a2', 'libdir_a')], cursor: null }],
+    ['libdir_b::FIRST', { items: [file('b', 'libdir_b')], cursor: null }],
+  ]);
+  let checkpoint;
+  let stop = false;
+  await assert.rejects(tool.traverseLibraryTree(async (parent, cursor) => pages.get(`${parent || 'ROOT'}::${cursor || 'FIRST'}`), {
+    shouldStop: () => stop,
+    onPage: ({ pages: pageCount }) => { if (pageCount === 1) stop = true; },
+    onCheckpoint: (value) => { checkpoint = value; },
+  }), /STOP_REQUESTED/);
+  const resumed = await tool.traverseLibraryTree(async (parent, cursor) => pages.get(`${parent || 'ROOT'}::${cursor || 'FIRST'}`), { checkpoint });
+  const fresh = await tool.traverseLibraryTree(async (parent, cursor) => pages.get(`${parent || 'ROOT'}::${cursor || 'FIRST'}`));
+  assert.deepEqual(resumed.files.map((record) => record.libraryFileId).sort(), fresh.files.map((record) => record.libraryFileId).sort());
+  assert.equal(resumed.complete, true);
+});
+
+test('scan-delete state decision distinguishes fresh, resume, complete reuse, and invalidated checkpoint', () => {
+  assert.equal(tool.decideScanDeleteAction({ recordCount: 0, scanComplete: false, checkpointValid: false, datasetMutated: false }), 'fresh-streaming-scan-delete');
+  assert.equal(tool.decideScanDeleteAction({ recordCount: 12, scanComplete: true, checkpointValid: false, datasetMutated: false }), 'delete-existing-complete-scan');
+  assert.equal(tool.decideScanDeleteAction({ recordCount: 12, scanComplete: false, checkpointValid: true, datasetMutated: false }), 'resume-scan-then-delete');
+  assert.equal(tool.decideScanDeleteAction({ recordCount: 12, scanComplete: false, checkpointValid: false, datasetMutated: true }), 'fresh-streaming-scan-delete');
+  assert.equal(tool.decideScanDeleteAction({ recordCount: 12, scanComplete: true, checkpointValid: true, datasetMutated: true }), 'fresh-streaming-scan-delete');
+});
+
+test('a dataset mutation invalidates the old scan checkpoint', () => {
+  assert.equal(tool.invalidateScanCheckpoint({ version: 1, valid: true }), null);
+});
+
 test('getDeletionTime never falls back to createdAt', () => {
   assert.equal(tool.getDeletionTime({ createdAt: '2020-01-01T00:00:00Z' }), null);
   assert.equal(tool.getDeletionTime({ deletionAt: null, createdAt: '2020-01-01T00:00:00Z' }), null);
@@ -531,17 +621,28 @@ test('UI matches include full paths and ambiguous entries', () => {
   ]);
 });
 
-test('userscript metadata is 0.8.9 and points update/download to the public raw file', () => {
+test('userscript metadata is 0.9.0 and points update/download to the public raw file', () => {
   const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
   const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
   const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
   const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
-  assert.equal(version, '0.8.9');
+  assert.equal(version, '0.9.0');
   assert.equal(scriptVersion, version);
   assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, /^\/\/ @homepageURL\s+https:\/\/github\.com\/DearJIAN\/chatgpt-library-cleanup-userscript$/m);
   assert.match(source, /^\/\/ @supportURL\s+https:\/\/github\.com\/DearJIAN\/chatgpt-library-cleanup-userscript\/issues$/m);
+});
+
+test('scan-delete UI and lifecycle do not retain stale active queue state', () => {
+  const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
+  assert.match(source, /if \(\(state\.scanning \|\| state\.deleting\) && state\.deleteQueue\)/);
+  assert.match(source, /state\.deleteQueue = null;/);
+  assert.match(source, /id="cgpt-lib-tool-delete-verified"/);
+  assert.doesNotMatch(source, /创建日期在/);
+  assert.match(source, /Library 修改时间在/);
+  const startDelete = source.slice(source.indexOf('async function startDelete()'), source.indexOf('async function startDeleteScannedRecords()'));
+  assert.doesNotMatch(startDelete, /state\.scan\.records\s*=\s*new Map\(\)/);
 });
 
 test('recursive diagnostic sanitizer redacts identity fields but preserves library diagnosis fields', () => {
