@@ -4,6 +4,35 @@
 
 项目早期没有建立独立 CHANGELOG，以下内容根据现有 Git 提交历史补录。
 
+## [0.8.9] - 2026-09-02
+
+Commit: `4ebc1b0` — `Remove deletion-time fallback and fix diagnostics`
+
+### Fixed
+
+- 彻底移除真实删除时间对 `createdAt` 的最后 fallback；删除时间仅接受扫描阶段提取的 `deletionAt` 或直接的 `updated_at` / `updatedAt`。
+- `updated_at` 缺失、为 `null`、为空或无法解析时继续 fail closed：文件默认保留，不会回退到创建、上传、处理或其他 modified 时间字段。
+- 时间诊断摘要新增 `deletionTimeSources`；面板“当前删除日期来源”改为展示真实删除字段来源，不再误显示 `createdAtSources`。
+
+### Changed
+
+- userscript 与内部 `SCRIPT_VERSION` 升级为 0.8.9；扫描、cutoff 边界、Google Drive 排除、soft delete、verification、并发、重试与停止行为保持不变。
+
+## [0.8.8] - 2026-09-02
+
+Commit: `f118787` — `Align deletion cutoff with Library updated_at`
+
+### Changed
+
+- 在可控重命名实验确认 Library UI「修改时间」对应 `updated_at` 后，正式把真实删除截止日期语义从创建/上传时间切换到 verified `updated_at`。
+- 新增 `DELETION_TIME_KEYS = ['updated_at', 'updatedAt']` 以及 `deletionAt`、`deletionTimeSource`、`deletionTimePath`；删除队列、目标筛选、verification 和“最早日期”统计统一使用该删除时间。
+- 保留 `createdAt`、创建/上传/处理时间及 raw time fields，仅用于历史信息与时间诊断。
+
+### Safety
+
+- `updated_at` 缺失、为 `null` 或非法时不进入删除目标；不以 `record_creation_time`、`file_upload_time`、`file_processed_time` 或 `modified_at` 等字段作为删除 fallback。
+- “删除截至日期（含当天）”边界规则未改变：内部仍以所选日期次日本地 `00:00` 作为 exclusive end。
+
 ## [0.8.7] - 2026-09-02
 
 ### Fixed
