@@ -629,12 +629,12 @@ test('UI matches include full paths and ambiguous entries', () => {
   ]);
 });
 
-test('userscript metadata is 0.9.1 and points update/download to the public raw file', () => {
+test('userscript metadata is 1.0.0 and points update/download to the public raw file', () => {
   const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'chatgpt_library_tool_scriptcat.user.js'), 'utf8');
   const version = source.match(/^\/\/ @version\s+(.+)$/m)?.[1]?.trim();
   const scriptVersion = source.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
   const raw = 'https://raw.githubusercontent.com/DearJIAN/chatgpt-library-cleanup-userscript/main/chatgpt_library_tool_scriptcat.user.js';
-  assert.equal(version, '0.9.1');
+  assert.equal(version, '1.0.0');
   assert.equal(scriptVersion, version);
   assert.match(source, new RegExp(`^// @updateURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
   assert.match(source, new RegExp(`^// @downloadURL\\s+${raw.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}$`, 'm'));
