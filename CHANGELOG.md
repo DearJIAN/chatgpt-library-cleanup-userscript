@@ -4,6 +4,49 @@
 
 项目早期没有建立独立 CHANGELOG，以下内容根据现有 Git 提交历史补录。
 
+## [1.0.0] - 2026-09-02
+
+### Release status
+
+- 首个稳定版本。
+- 本版本**不增加新的扫描或删除能力**；以 0.9.1 已完成并经过真实浏览器验收的行为作为稳定基线。
+- Userscript `@version` 与内部 `SCRIPT_VERSION` 统一升级为 `1.0.0`。
+- Userscript metadata 描述更新为当前稳定能力说明。
+- README 按当前真实界面重新整理，重点补全每个统计字段、参数、按钮、状态栏和常见弹窗的语义。
+
+### Documentation clarified
+
+- 明确“自动扫描全部”是**纯只读动作**：只读取 Library，不执行 soft delete；扫描完成不会自动进入删除流程，也不会自动弹出删除确认。
+- 明确状态栏“扫描完整：可以执行删除”只是信息提示，表示用户现在可以自行决定是否执行删除，不代表脚本自动删除。
+- 明确“扫描并删除旧文件”的三种状态：fresh streaming、partial checkpoint resume、complete scan reuse。
+- 明确已经完整扫描后再次执行“扫描并删除旧文件”会复用现有完整 records，删除前不会再从 ROOT 重扫。
+- 明确“删除已扫描旧文件”只处理当前 records，不会继续扫描未覆盖部分。
+- 逐项解释“捕获请求”“扫描文件”“最早日期”“扫描模式”“已处理目录”“待处理目录”“总请求”“当前 cursor”“将删除”“删除接口”和状态栏。
+- 明确状态栏中的“网络请求中”表示当前仍在等待返回的 HTTP 请求数量；“总请求”表示当前 scan pass 累计扫描请求，两者不是同一统计。
+- 明确界面“并发”表示**删除并发**，控制 soft-delete worker 数量，不代表扫描会同时开启相同数量的 cursor 请求。
+- 补充常见弹窗说明：
+  - “当前 Library 已完成完整扫描，无需重复扫描。”来自再次点击只读扫描；
+  - “完整扫描后，没有发现 ... 可删除本地文件。”属于用户主动进入删除流程后的零目标提示，并非自动扫描完成提示；
+  - 首个 soft-delete probe 与 cleanup verification 的完成条件分别说明。
+- README 使用当前 1.0.0 界面截图 `docs/images/library-tool-panel.png`。
+
+### Stable safety baseline
+
+- Library UI「修改时间」继续使用已实测确认的 `updated_at`。
+- `updated_at` 缺失、为空或非法时 fail closed，不回退到创建、上传、处理或其他 modified 字段。
+- Google Drive / external 目录树继续排除。
+- 首次当前页面 session 的真实删除继续执行单文件 soft-delete probe，并要求人工确认。
+- 清理后最多 3 轮从 ROOT 开始的 verification scan 保持不变。
+- Stop → Resume checkpoint、删除后 checkpoint 失效、成功删除 records prune、schema-drift warning 均保持 0.9.1 行为。
+
+### Real-world acceptance carried into 1.0
+
+- 已在真实 Library 中确认 probe 文件 `Transformer注意力机制信息图解.png` soft-delete 后从主列表消失。
+- 已完成一轮 4 个目标的真实清理：成功 4、失败 0，后续 ROOT verification 确认未发现遗漏旧文件。
+- 已在真实浏览器中确认 complete-scan reuse：完整扫描后再点击“扫描并删除旧文件”，脚本直接复用现有 records，而不是重新从 ROOT 扫描。
+
+---
+
 ## [0.9.1] - 2026-09-02
 
 Commit: `314c3f1` — `Fix verification lifecycle and stale scan records`
@@ -301,6 +344,7 @@ Commit: `215ffc0` — `Fix ChatGPT Library tree scanning`
 
 ## Versioning notes
 
-- 本项目处于快速迭代阶段，早期没有 Git tag / GitHub Release；版本号以 userscript metadata 中的 `@version` 为准。
+- 早期版本处于快速迭代阶段，没有 Git tag / GitHub Release；版本号以 userscript metadata 中的 `@version` 为准。
 - `0.5.0 / 0.6.0` 属于早期开发阶段，曾存在 metadata 与内部常量不一致，因此在本 CHANGELOG 中合并说明。
-- 从 `0.7.0` 起，版本号在 metadata、内部 `SCRIPT_VERSION` 与 README 中保持一致。
+- 从 `0.7.0` 起，metadata 与内部 `SCRIPT_VERSION` 保持一致。
+- `1.0.0` 起视为首个稳定基线版本。
